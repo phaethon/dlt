@@ -46,7 +46,7 @@ class StarrocksObjectStorageLoadJob(CopyRemoteFileLoadJob):
         self.table = table
         self.load_id = load_id
         self._staging_kwargs = staging_kwargs
-        
+
     def run(self) -> None:
         _sql_client = self._job_client.sql_client
         # Copy the table to the current dataset (i.e. staging) if needed
@@ -65,7 +65,7 @@ class StarrocksObjectStorageLoadJob(CopyRemoteFileLoadJob):
         file_format = bucket_path.split('.')[-1]
         if file_format != 'parquet':
             raise DatabaseTransientException(Exception('Only parquet files currently supported for load from Object Storage'))
-        
+
         # if self._staging_iam_role:
         #     credentials = f"IAM_ROLE '{self._staging_iam_role}'"
         if self._staging_credentials and isinstance(
@@ -97,11 +97,11 @@ class StarrocksObjectStorageLoadJob(CopyRemoteFileLoadJob):
                 logger.info('Starrocks: query INSERT INTO ... FROM FILES')
                 _sql_client.execute_sql(stmt)
 
-            
+
             logger.info(f'Starrocks: insert from storage files job for table {self.table.name} finished')
         else:
             raise DatabaseTransientException(Exception('Cannot Broker Load without staging credentials'))
-    
+
 class StarrocksStreamLoadJob(RunnableLoadJob, HasFollowupJobs):
     def __init__(self, file_path: str, table: sa.Table, load_id: str) -> None:
         super().__init__(file_path)
@@ -113,6 +113,7 @@ class StarrocksStreamLoadJob(RunnableLoadJob, HasFollowupJobs):
         c = self._job_client.config.credentials
         # url = f'http://{c.http_host}:{c.http_port}/api/{self._job_client.sql_client.dataset_name}/{self.table.name}/_stream_load'
         url_base = f'http://{c.http_host}:{c.http_port}/api/transaction/'
+        logger.info(f'Starrocks stream load connecting to {url_base}')
         auth = aiohttp.BasicAuth(login=c.username, password=c.password)
         async with aiohttp.ClientSession(auth=auth) as session:
             headers = {
@@ -121,14 +122,14 @@ class StarrocksStreamLoadJob(RunnableLoadJob, HasFollowupJobs):
                 "format": "JSON",
                 "strip_outer_array": "true"
             }
-            
+
             label = self.load_id.replace('.', '-') + '-' + secrets.token_hex(2)
             headers['label'] = label
             async with session.post(url_base + 'begin', expect100 = True, headers = headers) as resp:
                 resp_dict = json.loads(await resp.text())
                 if resp.status != 200 or resp_dict["Status"] != "OK":
                     raise DatabaseTransientException(Exception('Failed to start Stream Load transaction'))
-                
+
             for chunk in self._iter_data_item_chunks():
                 async with session.put(url_base + 'load', expect100 = True, headers = headers, data = json.dumps(chunk)) as resp:
                     resp_dict = json.loads(await resp.text())
@@ -139,7 +140,7 @@ class StarrocksStreamLoadJob(RunnableLoadJob, HasFollowupJobs):
                 if resp.status != 200 or resp_dict["Status"] != "OK":
                     # print(resp_dict)
                     raise DatabaseTransientException(Exception('Failed to commit Stream Load transaction'))
-        
+
     def _open_load_file(self) -> IO[bytes]:
         return FileStorage.open_zipsafe_ro(self._file_path, "rb")
 
@@ -313,11 +314,16 @@ class StarrocksJobClient(SqlalchemyJobClient, SupportsStagingDestination):
         self, table: PreparedTableSchema, file_path: str, load_id: str, restore: bool = False
     ) -> LoadJob:
         job = None
-        
+
         if file_path.endswith(".typed-jsonl"):
+            # Debug
+            logger.info('Starrocks: typed-jsonl detected')
             table_obj = self._to_table_object(table)
             job = StarrocksStreamLoadJob(file_path, table_obj, load_id)
         elif file_path.endswith(".parquet") or file_path.endswith(".reference"):
+            # Debug
+            logger.info('Starrocks: parquet detected')
+
             table_obj = self._to_table_object(table)
             job = StarrocksObjectStorageLoadJob(
                     file_path,
@@ -325,11 +331,13 @@ class StarrocksJobClient(SqlalchemyJobClient, SupportsStagingDestination):
                     load_id,
                     staging_credentials = self.config.staging_config.credentials,
                     staging_kwargs = self.config.staging_config.kwargs)
-        
+        else:
+            logger.info(f'Starrocks: unsupported load file extension for {file_path}')
+
         if job is not None:
             return job
 
-        logger.warn('Falling back to sqlalchemy')
-        
+        logger.warn('Starrocks: falling back to sqlalchemy')
+
         job = super().create_load_job(table, file_path, load_id, restore)
         return job
