@@ -93,6 +93,7 @@ jobs:
               filesystem_drivers: "[\"memory\"]"
               extras: "--extra lancedb --extra parquet"
               post_install_commands: "uv run pip install openai"
+              always_run_all_tests: true
 
             # Motherduck
             - name: motherduck
@@ -100,12 +101,20 @@ jobs:
               filesystem_drivers: "[\"memory\"]"
               extras: "--extra motherduck --extra s3 --extra gs --extra az --extra parquet"
 
+            # Ducklake
+            - name: ducklake
+              destinations: "[\"ducklake\"]"
+              filesystem_drivers: "[\"s3\", \"gs\", \"abfss\"]"
+              extras: "--extra ducklake --extra s3 --extra gs --extra az --extra parquet"
+              always_run_all_tests: true
+
             # MSSQL
             - name: mssql
               destinations: "[\"mssql\"]"
               filesystem_drivers: "[\"memory\"]"
-              extras: "--extra mssql --extra s3 --extra gs --extra az --extra parquet"
+              extras: "--extra mssql --extra s3 --extra gs --extra az --extra parquet --group adbc"
               pre_install_commands: "sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18"
+              post_install_commands: "uv run dbc install mssql"
               always_run_all_tests: true
 
             # Synapse
@@ -125,6 +134,7 @@ jobs:
               destinations: "[\"postgres\"]"
               filesystem_drivers: "[\"memory\", \"file\"]"
               extras: "--group adbc --extra postgres --extra postgis --extra parquet --extra duckdb"
+              post_install_commands: "uv pip install adbc-driver-postgresql"  # use adbc driver installation
               always_run_all_tests: true
 
             # Qdrant (disabled, because we do not have a test account atm, qdrant is tested with local version)
@@ -148,6 +158,23 @@ jobs:
       run:
         shell: bash
     runs-on: "ubuntu-latest"
+
+    services:
+      # we need local postgres to run ducklake tests quickly
+      postgres:
+        image: postgres
+        env:
+          POSTGRES_DB: dlt_data
+          POSTGRES_USER: loader
+          POSTGRES_PASSWORD: loader
+        ports:
+          - 5432:5432
+        # Set health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
 

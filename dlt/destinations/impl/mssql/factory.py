@@ -1,5 +1,6 @@
 from typing import Any, Optional, Type, Union, Dict, TYPE_CHECKING
 
+from dlt.common import logger
 from dlt.common.destination import Destination, DestinationCapabilitiesContext
 from dlt.common.destination.typing import PreparedTableSchema
 from dlt.common.exceptions import TerminalValueError
@@ -8,6 +9,7 @@ from dlt.common.data_writers.escape import escape_postgres_identifier, escape_ms
 from dlt.common.arithmetics import DEFAULT_NUMERIC_PRECISION, DEFAULT_NUMERIC_SCALE
 
 from dlt.common.schema.typing import TColumnSchema, TColumnType
+from dlt.destinations._adbc_jobs import make_adbc_parquet_file_format_selector
 from dlt.destinations.type_mapping import TypeMapperImpl
 from dlt.destinations.impl.mssql.configuration import MsSqlCredentials, MsSqlClientConfiguration
 
@@ -42,6 +44,7 @@ class MsSqlTypeMapper(TypeMapperImpl):
         "float": "double",
         "bit": "bool",
         "datetimeoffset": "timestamp",
+        "datetime2": "timestamp",
         "date": "date",
         "bigint": "bigint",
         "varbinary": "binary",
@@ -52,6 +55,35 @@ class MsSqlTypeMapper(TypeMapperImpl):
         "int": "bigint",
         "json": "json",
     }
+
+    def to_db_datetime_type(
+        self,
+        column: TColumnSchema,
+        table: PreparedTableSchema = None,
+    ) -> str:
+        column_name = column["name"]
+        table_name = table["name"]
+        timezone = column.get("timezone", True)
+        precision = column.get("precision")
+
+        # Synapse DATETIME2 allows precision from 0-7
+        if precision is not None and (precision < 0 or precision > 7):
+            logger.warn(
+                "Azure Synapse/MSSQL only supports precision between 0-7 for column"
+                f" '{column_name}' in table '{table_name}'. Will use precision 7."
+            )
+            precision = self.capabilities.max_timestamp_precision
+
+        # NOTE: default precision on MSSQL is 7 and we'll use it. default caps precision is 6
+        #  but setting it to 7 will generate nano precision timestamps in arrow
+        precision_str = ""
+        if precision is not None:
+            precision_str = f"({precision})"
+
+        if timezone:
+            return f"datetimeoffset{precision_str}"  # mssql's timezone-aware datetime type
+        else:
+            return f"datetime2{precision_str}"  # mssql's high-precision datetime without timezone
 
     def to_db_integer_type(self, column: TColumnSchema, table: PreparedTableSchema = None) -> str:
         precision = column.get("precision")
@@ -75,6 +107,8 @@ class MsSqlTypeMapper(TypeMapperImpl):
         if db_type == "decimal":
             if (precision, scale) == self.capabilities.wei_precision:
                 return dict(data_type="wei")
+        if db_type == "datetime2":
+            return {"data_type": "timestamp", "timezone": False}
         return super().from_destination_type(db_type, precision, scale)
 
 
@@ -84,7 +118,12 @@ class mssql(Destination[MsSqlClientConfiguration, "MsSqlJobClient"]):
     def _raw_capabilities(self) -> DestinationCapabilitiesContext:
         caps = DestinationCapabilitiesContext()
         caps.preferred_loader_file_format = "insert_values"
-        caps.supported_loader_file_formats = ["insert_values", "model"]
+        caps.supported_loader_file_formats = ["insert_values", "parquet", "model"]
+        caps.loader_file_format_selector = make_adbc_parquet_file_format_selector(
+            "mssql",
+            "https://dlthub.com/docs/dlt-ecosystem/destinations/mssql#data-loading",
+            prefer_parquet=True,
+        )
         caps.preferred_staging_file_format = None
         caps.supported_staging_file_formats = []
         caps.type_mapper = MsSqlTypeMapper
@@ -108,7 +147,9 @@ class mssql(Destination[MsSqlClientConfiguration, "MsSqlJobClient"]):
         caps.supports_multiple_statements = True
         caps.supports_create_table_if_not_exists = False  # IF NOT EXISTS not supported
         caps.max_rows_per_insert = 1000
-        caps.timestamp_precision = 7
+        # NOTE: timestamp_precision is 7 in the database but there's no way to write it via Python
+        caps.timestamp_precision = 6
+        caps.max_timestamp_precision = 7
         caps.supported_merge_strategies = ["delete-insert", "upsert", "scd2"]
         caps.supported_replace_strategies = [
             "truncate-and-insert",

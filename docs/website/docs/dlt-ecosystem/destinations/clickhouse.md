@@ -14,6 +14,8 @@ keywords: [ clickhouse, destination, data warehouse ]
 pip install "dlt[clickhouse]"
 ```
 
+<!--@@@DLT_DESTINATION_CAPABILITIES clickhouse-->
+
 ## Setup guide
 
 ### 1. Initialize the dlt project
@@ -242,7 +244,7 @@ project_id = "my-awesome-project"
 endpoint_url = "https://storage.googleapis.com"
 ```
 
-:::caution
+:::warning
 When configuring the `bucket_url` for S3-compatible storage services like Google Cloud Storage (GCS) with ClickHouse in dlt, ensure that the URL is prepended with `s3://` instead of `gs://`. This is
 because the ClickHouse GCS table function requires the use of HMAC credentials, which are compatible with the S3 API. Prepending with `s3://` allows the HMAC credentials to integrate properly with
 dlt's staging mechanisms for ClickHouse.

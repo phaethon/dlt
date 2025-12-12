@@ -8,6 +8,8 @@ keywords: [aws, athena, glue catalog]
 
 The Athena destination stores data as Parquet files in S3 buckets and creates [external tables in AWS Athena](https://docs.aws.amazon.com/athena/latest/ug/creating-tables.html). You can then query those tables with Athena SQL commands, which will scan the entire folder of Parquet files and return the results. This destination works very similarly to other SQL-based destinations, with the exception that the merge write disposition is not supported at this time. The `dlt` metadata will be stored in the same bucket as the Parquet files, but as iceberg tables. Athena also supports writing individual data tables as Iceberg tables, so they may be manipulated later. A common use case would be to strip GDPR data from them.
 
+<!--@@@DLT_DESTINATION_CAPABILITIES athena-->
+
 ## Install dlt with Athena
 **To install the dlt library with Athena dependencies:**
 ```sh
@@ -32,7 +34,7 @@ pip install -r requirements.txt
 ```
 or with `pip install "dlt[athena]"`, which will install `s3fs`, `pyarrow`, `pyathena`, and `botocore` packages.
 
-:::caution
+:::warning
 
 You may also install the dependencies independently. Try
 ```sh
@@ -150,7 +152,7 @@ Athena tables store timestamps with millisecond precision, and with that precisi
 
 Athena does not support JSON fields, so JSON is stored as a string.
 
-:::caution
+:::warning
 **Athena does not support TIME columns in parquet files**. `dlt` will fail such jobs permanently. Convert `datetime.time` objects to `str` or `datetime.datetime` to load them.
 :::
 

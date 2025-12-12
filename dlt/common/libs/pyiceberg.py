@@ -1,7 +1,9 @@
 import os
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
+import warnings
 
 from fsspec import AbstractFileSystem
+from packaging.version import Version
 
 from dlt import version
 from dlt.common import logger
@@ -22,11 +24,15 @@ from dlt.destinations.impl.filesystem.filesystem import FilesystemClient
 
 
 try:
+    import pyiceberg
     from pyiceberg.table import Table as IcebergTable
     from pyiceberg.catalog import Catalog as IcebergCatalog
     from pyiceberg.exceptions import NoSuchTableError
+    from pyiceberg.partitioning import (
+        UNPARTITIONED_PARTITION_SPEC,
+        PartitionSpec as IcebergPartitionSpec,
+    )
     import pyarrow as pa
-    import pyiceberg.io.pyarrow as _pio
 except ModuleNotFoundError:
     raise MissingDependencyException(
         "dlt pyiceberg helpers",
@@ -34,19 +40,20 @@ except ModuleNotFoundError:
         "Install `pyiceberg` so dlt can create Iceberg tables in the `filesystem` destination.",
     )
 
+pyiceberg_semver = Version(pyiceberg.__version__)
 
-# TODO: remove with pyiceberg's release after 0.9.1
-_orig_get_kwargs = _pio._get_parquet_writer_kwargs
+if pyiceberg_semver < Version("0.10.0"):
+    import pyiceberg.io.pyarrow as _pio
 
+    _orig_get_kwargs = _pio._get_parquet_writer_kwargs
 
-def _patched_get_parquet_writer_kwargs(table_properties):  # type: ignore[no-untyped-def]
-    """Return the original kwargs **plus** store_decimal_as_integer=True."""
-    kwargs = _orig_get_kwargs(table_properties)
-    kwargs.setdefault("store_decimal_as_integer", True)
-    return kwargs
+    def _patched_get_parquet_writer_kwargs(table_properties):  # type: ignore[no-untyped-def]
+        """Return the original kwargs **plus** store_decimal_as_integer=True."""
+        kwargs = _orig_get_kwargs(table_properties)
+        kwargs.setdefault("store_decimal_as_integer", True)
+        return kwargs
 
-
-_pio._get_parquet_writer_kwargs = _patched_get_parquet_writer_kwargs
+    _pio._get_parquet_writer_kwargs = _patched_get_parquet_writer_kwargs
 
 
 def ensure_iceberg_compatible_arrow_schema(schema: pa.Schema) -> pa.Schema:
@@ -140,10 +147,6 @@ def get_sql_catalog(
     )
 
 
-# def ensure_pyiceberg_local_path(location: str) -> str:
-#     """Converts local absolute paths into file urls."""
-
-
 def evolve_table(
     catalog: IcebergCatalog,
     client: FilesystemClient,
@@ -176,20 +179,33 @@ def create_table(
     catalog: IcebergCatalog,
     table_id: str,
     table_location: str,
-    schema: pa.Schema,
+    schema: Union[pa.Schema, "pyiceberg.schema.Schema"],
     partition_columns: Optional[List[str]] = None,
+    partition_spec: Optional[IcebergPartitionSpec] = UNPARTITIONED_PARTITION_SPEC,
 ) -> None:
-    # found no metadata; create new table
+    if isinstance(schema, pa.Schema):
+        schema = ensure_iceberg_compatible_arrow_schema(schema)
 
-    with catalog.create_table_transaction(
-        table_id,
-        schema=ensure_iceberg_compatible_arrow_schema(schema),
-        location=table_location,
-    ) as txn:
-        # add partitioning
-        with txn.update_spec() as update_spec:
-            for col in partition_columns:
-                update_spec.add_identity(col)
+    if partition_columns:
+        warnings.warn(
+            "partition_columns is deprecated. Use partition_spec instead.", DeprecationWarning
+        )
+        with catalog.create_table_transaction(
+            table_id,
+            schema=schema,
+            location=table_location,
+        ) as txn:
+            # add partitioning
+            with txn.update_spec() as update_spec:
+                for col in partition_columns:
+                    update_spec.add_identity(col)
+    else:
+        catalog.create_table(
+            identifier=table_id,
+            schema=schema,
+            location=table_location,
+            partition_spec=partition_spec,
+        )
 
 
 def get_iceberg_tables(

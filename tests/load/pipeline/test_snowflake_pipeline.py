@@ -1,6 +1,7 @@
 from copy import deepcopy
 import os
 import pytest
+from typing import cast
 from pytest_mock import MockerFixture
 
 import dlt
@@ -9,17 +10,16 @@ from dlt.common.utils import uniq_id
 from dlt.destinations.exceptions import DatabaseUndefinedRelation
 from dlt.load.exceptions import LoadClientJobFailed
 from dlt.pipeline.exceptions import PipelineStepFailed
+from tests.load.pipeline.utils import simple_nested_pipeline
 from tests.load.snowflake.test_snowflake_client import QUERY_TAG
 
-from tests.load.pipeline.test_pipelines import simple_nested_pipeline
 from tests.pipeline.utils import assert_load_info, assert_query_column
 from tests.load.utils import (
-    TABLE_UPDATE_COLUMNS_SCHEMA,
     assert_all_data_types_row,
     destinations_configs,
     DestinationTestConfiguration,
 )
-from tests.cases import TABLE_ROW_ALL_DATA_TYPES_DATETIMES
+from tests.cases import TABLE_ROW_ALL_DATA_TYPES_DATETIMES, table_update_and_row
 
 
 # mark all tests as essential, do not remove
@@ -204,7 +204,7 @@ def test_char_replacement_cs_naming_convention(
     rel_ = pipeline.dataset()["AMLPerFornyelseoe"]
     results = rel_.fetchall()
     assert len(results) == 1
-    assert "AmlSistUtfoertDato" in rel_.columns_schema
+    assert "AmlSistUtfoertDato" in rel_.columns
 
 
 @pytest.mark.parametrize(
@@ -233,10 +233,10 @@ def test_snowflake_use_vectorized_scanner(
     load_job_spy = mocker.spy(snowflake, "gen_copy_sql")
 
     data_types = deepcopy(TABLE_ROW_ALL_DATA_TYPES_DATETIMES)
-    column_schemas = deepcopy(TABLE_UPDATE_COLUMNS_SCHEMA)
+    columns_schema, _ = table_update_and_row()
     expected_rows = deepcopy(TABLE_ROW_ALL_DATA_TYPES_DATETIMES)
 
-    @dlt.resource(table_name="data_types", write_disposition="merge", columns=column_schemas)
+    @dlt.resource(table_name="data_types", write_disposition="merge", columns=columns_schema)
     def my_resource():
         nonlocal data_types
         yield [data_types] * 10
@@ -308,12 +308,85 @@ def test_snowflake_use_vectorized_scanner(
         db_row = list(db_rows[0])
         # "snowflake" does not parse JSON from parquet string so double parse
         assert_all_data_types_row(
+            sql_client.capabilities,
             db_row,
             expected_row=expected_rows,
-            schema=column_schemas,
+            schema=columns_schema,
             parse_json_strings=True,
-            timestamp_precision=6,
         )
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["snowflake"]),
+    ids=lambda x: x.name,
+)
+def test_snowflake_cluster_hints(destination_config: DestinationTestConfiguration) -> None:
+    from dlt.destinations.impl.snowflake.sql_client import SnowflakeSqlClient
+
+    def get_cluster_key(sql_client: SnowflakeSqlClient, table_name: str) -> str:
+        with sql_client:
+            _catalog_name, schema_name, table_names = sql_client._get_information_schema_components(
+                table_name
+            )
+            qry = f"""
+                SELECT CLUSTERING_KEY FROM INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_SCHEMA = '{schema_name}'
+                AND TABLE_NAME = '{table_names[0]}'
+            """
+            return sql_client.execute_sql(qry)[0][0]
+
+    pipeline = destination_config.setup_pipeline("test_snowflake_cluster_hints", dev_mode=True)
+    sql_client = cast(SnowflakeSqlClient, pipeline.sql_client())
+    table_name = "test_snowflake_cluster_hints"
+
+    @dlt.resource(table_name=table_name)
+    def test_data():
+        return [
+            {"c1": 1, "c2": "a"},
+            {"c1": 2, "c2": "b"},
+        ]
+
+    # create new table with clustering
+    test_data.apply_hints(columns=[{"name": "c1", "cluster": True}])
+    info = pipeline.run(test_data(), **destination_config.run_kwargs)
+    assert_load_info(info)
+    assert get_cluster_key(sql_client, table_name) == 'LINEAR("C1")'
+
+    # change cluster hints on existing table without adding new column
+    test_data.apply_hints(columns=[{"name": "c2", "cluster": True}])
+    info = pipeline.run(test_data(), **destination_config.run_kwargs)
+    assert_load_info(info)
+    assert get_cluster_key(sql_client, table_name) == 'LINEAR("C1")'  # unchanged (no new column)
+
+    # add new column to existing table with pending cluster hints from previous run
+    test_data.apply_hints(columns=[{"name": "c3", "data_type": "bool"}])
+    info = pipeline.run(test_data(), **destination_config.run_kwargs)
+    assert_load_info(info)
+    assert get_cluster_key(sql_client, table_name) == 'LINEAR("C1","C2")'  # updated
+
+    # remove clustering from existing table
+    test_data.apply_hints(
+        columns=[
+            {"name": "c1", "cluster": False},
+            {"name": "c2", "cluster": False},
+            {"name": "c4", "data_type": "bool"},  # include new column to trigger alter
+        ]
+    )
+    info = pipeline.run(test_data(), **destination_config.run_kwargs)
+    assert_load_info(info)
+    assert get_cluster_key(sql_client, table_name) is None
+
+    # add clustering to existing table (and add new column to trigger alter)
+    test_data.apply_hints(
+        columns=[
+            {"name": "c1", "cluster": True},
+            {"name": "c5", "data_type": "bool"},  # include new column to trigger alter
+        ]
+    )
+    info = pipeline.run(test_data(), **destination_config.run_kwargs)
+    assert_load_info(info)
+    assert get_cluster_key(sql_client, table_name) == 'LINEAR("C1")'
 
 
 @pytest.mark.skip(reason="perf test for merge")
