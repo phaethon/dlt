@@ -32,6 +32,7 @@ from dlt.common.utils import chunks, digest128, uniq_id
 
 from dlt.extract import DltSource
 from dlt.extract.incremental import Incremental, IncrementalResourceWrapper
+from dlt.extract.incremental.context import TimeIntervalContext
 from dlt.extract.pipe import Pipe
 from dlt.extract.state import resource_state
 from dlt.extract.incremental.exceptions import (
@@ -46,7 +47,7 @@ from dlt.extract.resource import DltResource
 from dlt.pipeline.exceptions import PipelineStepFailed
 from dlt.sources.helpers.transform import take_first
 
-from tests.extract.utils import AssertItems, data_item_to_list
+from tests.extract.utils import data_item_to_list
 from tests.pipeline.utils import assert_query_column
 from tests.utils import (
     ALL_TEST_DATA_ITEM_FORMATS,
@@ -609,6 +610,8 @@ def test_cursor_datetime_type(item_type: TestDataItemFormat) -> None:
         "created_at"
     ]
     assert s["last_value"] == initial_value + timedelta(minutes=4)
+    # fresh state: start_value snapshots the configured initial_value
+    assert s["start_value"] == initial_value
 
 
 @pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
@@ -983,7 +986,7 @@ def test_cursor_path_none_can_raise_on_none_2(item_type: TestDataItemFormat) -> 
         assert isinstance(e.value.__context__, IncrementalCursorPathMissing)
     else:
         assert isinstance(e.value.__context__, IncrementalCursorPathHasValueNone)
-    assert e.value.__context__.json_path == "created_at"  # type: ignore[attr-defined]
+    assert e.value.__context__.json_path == "created_at"
 
 
 @pytest.mark.parametrize("item_type", ["arrow-table", "arrow-batch", "pandas"])
@@ -1370,7 +1373,7 @@ def test_start_value_set_to_last_value() -> None:
         p.run(r, destination="duckdb")
 
 
-@pytest.mark.parametrize("item_type", set(ALL_TEST_DATA_ITEM_FORMATS) - {"object"})
+@pytest.mark.parametrize("item_type", sorted(set(ALL_TEST_DATA_ITEM_FORMATS) - {"object"}))
 def test_start_value_set_to_last_value_arrow(item_type: TestDataItemFormat) -> None:
     p = dlt.pipeline(pipeline_name="p" + uniq_id(), destination="duckdb")
     now = pendulum.now()
@@ -1397,7 +1400,7 @@ def test_start_value_set_to_last_value_arrow(item_type: TestDataItemFormat) -> N
     p.run(some_data(False))
 
 
-@pytest.mark.parametrize("item_type", set(ALL_TEST_DATA_ITEM_FORMATS) - {"pandas"})
+@pytest.mark.parametrize("item_type", sorted(set(ALL_TEST_DATA_ITEM_FORMATS) - {"pandas"}))
 @pytest.mark.parametrize(
     "id_value",
     ("1231231231231271872", b"1231231231231271872", pendulum.now(), 1271.78, Decimal("1231.87")),
@@ -1455,6 +1458,7 @@ def test_replace_resets_state(item_type: TestDataItemFormat) -> None:
     info = p.run(standalone_some_data(item_type, now))
     print(p.last_trace.last_normalize_info)
     print(info)
+    # no data produced - no state change - no load packages
     assert len(info.loads_ids) == 0
     info = p.run(standalone_some_data(item_type, now), write_disposition="replace")
     assert len(info.loads_ids) == 1
@@ -1471,6 +1475,9 @@ def test_replace_resets_state(item_type: TestDataItemFormat) -> None:
     print(parent_r._pipe._steps)
     print(child._pipe._steps)
 
+    # no data produced - no state change - no load packages
+    info = p.run(child)
+    assert len(info.loads_ids) == 0
     # also transformer will not receive new data
     info = p.run(child)
     assert len(info.loads_ids) == 0
@@ -1543,6 +1550,8 @@ def test_incremental_as_transform(item_type: TestDataItemFormat) -> None:
     p = dlt.pipeline(pipeline_name="p" + uniq_id())
     info = p.run(r, destination="duckdb")
     assert len(info.loads_ids) == 1
+    # persisted state has start_value snapshotted at the initial_value (fresh state)
+    assert r.state["incremental"]["ts"]["start_value"] == now
 
 
 @pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
@@ -1558,6 +1567,153 @@ def test_incremental_explicit_disable_unique_check(item_type: TestDataItemFormat
         list(s)
         # no unique hashes at all
         assert s.state["incremental"]["ts"]["unique_hashes"] == []
+
+
+def test_incremental_merge_preserves_dedup_key_flag() -> None:
+    """Merge must preserve _dedup_key_from_hints from the explicit (other) incremental."""
+    # explicit pk=() must survive merge — flag stays False
+    default_inc: Incremental[int] = Incremental("cursor")
+    explicit_inc: Incremental[int] = Incremental("cursor", primary_key=())
+    merged = default_inc.merge(explicit_inc)
+    assert merged.primary_key == ()
+    assert merged._dedup_key_from_hints is False
+    # resource pk cannot override
+    merged.set_deduplication_key("id", from_hints=True)
+    assert merged.primary_key == ()
+
+    # explicit without pk — flag stays False from default's pk
+    default_inc2: Incremental[int] = Incremental("cursor", primary_key="alt_id")
+    explicit_inc2: Incremental[int] = Incremental("cursor", initial_value=0)
+    merged2 = default_inc2.merge(explicit_inc2)
+    assert merged2.primary_key == "alt_id"
+    assert merged2._dedup_key_from_hints is False
+    # resource pk cannot override — default's pk was explicitly set
+    merged2.set_deduplication_key("id", from_hints=True)
+    assert merged2.primary_key == "alt_id"
+
+    # copy preserves flag
+    original_inc: Incremental[int] = Incremental("cursor", primary_key=())
+    copied = original_inc.copy()
+    assert copied.primary_key == ()
+    assert copied._dedup_key_from_hints is False
+    copied.set_deduplication_key("id", from_hints=True)
+    assert copied.primary_key == ()
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+@pytest.mark.parametrize("dedup_key", [(), "alt_id"])
+def test_incremental_dedup_key_survives_resource_pk(
+    item_type: TestDataItemFormat,
+    dedup_key: Any,
+) -> None:
+    """Explicit dedup key on incremental default must not be overridden by resource pk."""
+    data = [
+        {"created_at": 1, "id": 1, "alt_id": 10},
+        {"created_at": 1, "id": 1, "alt_id": 20},
+    ]
+    source_items = data_to_item_format(item_type, data)
+
+    @dlt.resource(primary_key="id")
+    def some_data(
+        created_at=dlt.sources.incremental("created_at", primary_key=dedup_key),
+    ):
+        yield from source_items
+
+    p = dlt.pipeline(pipeline_name="p" + uniq_id())
+    p.extract(some_data)
+    assert some_data.incremental._incremental.primary_key == dedup_key
+    assert some_data.incremental.primary_key == some_data.incremental._incremental.primary_key
+
+
+def test_dynamic_dedup_key() -> None:
+    """Callable dedup key selects primary key based on item content."""
+
+    def dedup_key_fn(item: Any) -> str:
+        return "alt_id" if item.get("type") == "a" else "id"
+
+    @dlt.resource(primary_key="id", table_name=lambda i_: f"table_{i_['type']}")
+    def some_data(created_at=dlt.sources.incremental("created_at", primary_key=dedup_key_fn)):
+        yield [
+            {"created_at": 1, "id": 1, "alt_id": 10, "type": "a"},
+            {"created_at": 1, "id": 2, "alt_id": 10, "type": "a"},
+            {"created_at": 1, "id": 3, "alt_id": 10, "type": "b"},
+        ]
+
+    p = dlt.pipeline(pipeline_name="p" + uniq_id())
+    p.extract(some_data)
+    # dedup_key_fn is preserved, not overridden by resource pk
+    assert some_data.incremental._incremental.primary_key is dedup_key_fn
+    # row 1,2: type=a → key=alt_id → value=10 (duplicate)
+    # row 3: type=b → key=id → value=3
+    hashes = some_data.state["incremental"]["created_at"]["unique_hashes"]
+    assert set(hashes) == {digest128(json.dumps(10)), digest128(json.dumps(3))}
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_decorator_incremental_pk_not_overridden(
+    item_type: TestDataItemFormat,
+) -> None:
+    """When incremental with primary_key=() is set via @dlt.resource decorator,
+    the resource pk must not override it."""
+    data = [{"created_at": 1, "id": 1}, {"created_at": 1, "id": 2}]
+    source_items = data_to_item_format(item_type, data)
+
+    @dlt.resource(
+        primary_key="id",
+        incremental=dlt.sources.incremental("created_at", primary_key=()),
+    )
+    def some_data(created_at: Optional[dlt.sources.incremental[int]] = None):
+        yield from source_items
+
+    p = dlt.pipeline(pipeline_name="p" + uniq_id())
+    p.extract(some_data())
+    assert some_data.state["incremental"]["created_at"]["unique_hashes"] == []
+    assert some_data.incremental.primary_key == some_data.incremental._incremental.primary_key
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_non_aware_resource_incremental_pk_not_overridden(
+    item_type: TestDataItemFormat,
+) -> None:
+    """When incremental with primary_key=() is set on a resource that has no
+    incremental parameter (non-aware), the resource pk must not override it."""
+    data = [{"created_at": 1, "id": 1}, {"created_at": 1, "id": 2}]
+    source_items = data_to_item_format(item_type, data)
+
+    @dlt.resource(primary_key="id")
+    def some_data():
+        yield from source_items
+
+    r = some_data()
+    r.apply_hints(incremental=dlt.sources.incremental("created_at", primary_key=()))
+
+    p = dlt.pipeline(pipeline_name="p" + uniq_id())
+    p.extract(r)
+    assert r.state["incremental"]["created_at"]["unique_hashes"] == []
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_apply_hints_primary_key_does_not_override_incremental_empty_tuple(
+    item_type: TestDataItemFormat,
+) -> None:
+    """Regression for #3657: apply_hints(primary_key=...) after
+    apply_hints(incremental=incremental(primary_key=())) must not override the
+    empty-tuple primary key that disables deduplication."""
+
+    @dlt.resource
+    def some_data(last_timestamp=dlt.sources.incremental("ts")):
+        data = [{"delta": i, "ts": pendulum.now().timestamp()} for i in range(-10, 10)]
+        source_items = data_to_item_format(item_type, data)
+        yield from source_items
+
+    r = some_data()
+    r.apply_hints(incremental=dlt.sources.incremental("ts", primary_key=()))
+    r.apply_hints(primary_key=["delta"])
+
+    p = dlt.pipeline(pipeline_name="p" + uniq_id())
+    p.extract(r)
+    assert r.state["incremental"]["ts"]["unique_hashes"] == []
+    assert r.incremental.primary_key == r.incremental._incremental.primary_key
 
 
 @pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
@@ -1680,6 +1836,59 @@ def test_apply_hints_incremental(item_type: TestDataItemFormat) -> None:
     # remove incremental
     r.apply_hints(incremental=dlt.sources.incremental.EMPTY)
     assert r.incremental is None
+
+
+def test_set_hints_does_not_desync_wrapper_from_inner() -> None:
+    """Simulates deferred reflect: generator emits hints with primary_key via
+    dlt.mark.with_hints after inner incremental is already set. The wrapper
+    must stay in sync with inner after _set_hints processes the late hints."""
+
+    @dlt.resource
+    def some_data(created_at=dlt.sources.incremental("created_at", primary_key=())):
+        # emit late hints with primary_key, like sql_database deferred reflect
+        yield dlt.mark.with_hints(
+            [],
+            dlt.mark.make_hints(primary_key=["id"]),
+        )
+        yield [{"created_at": 1, "id": 1}, {"created_at": 1, "id": 2}]
+
+    r = some_data()
+
+    def _check_sync(item):
+        _r = dlt.current.resource()
+        if _r.incremental._incremental is not None:
+            assert _r.incremental.primary_key == _r.incremental._incremental.primary_key
+        return item
+
+    r.add_step(_check_sync)  # type: ignore[arg-type]
+
+    p = dlt.pipeline(pipeline_name="p" + uniq_id())
+    p.extract(r)
+    assert r.incremental.primary_key == r.incremental._incremental.primary_key
+
+
+def test_set_hints_syncs_wrapper_primary_key() -> None:
+    """Verify that _set_hints updates the IncrementalResourceWrapper's primary_key
+    when apply_hints changes the resource primary_key, so that wrapper.__call__
+    does not overwrite the incremental's primary_key with a stale value."""
+
+    @dlt.resource(primary_key="id")
+    def some_data(created_at=dlt.sources.incremental("created_at")):
+        yield [{"created_at": 1, "id": 1, "alt_id": 10}]
+
+    r = some_data()
+    # wrapper starts with primary_key="id" from the decorator
+    assert r.incremental.primary_key == "id"
+    # apply_hints changes the resource primary_key
+    r.apply_hints(primary_key=["id", "alt_id"])
+    # wrapper's primary_key must be updated so __call__ stays in sync
+    assert r.incremental.primary_key == ["id", "alt_id"]
+
+    # after extraction, inner incremental should also have the updated pk
+    p = dlt.pipeline(pipeline_name="p" + uniq_id())
+    p.extract(r)
+    assert r.incremental._incremental.primary_key == ["id", "alt_id"]
+    assert r.incremental.primary_key == r.incremental._incremental.primary_key
 
 
 def test_incremental_wrapper_on_clone_standalone_incremental() -> None:
@@ -1875,6 +2084,11 @@ def test_timezone_naive_datetime(item_type: TestDataItemFormat) -> None:
         resource.incremental.incremental._cached_state["last_value"]
         == pendulum_start_dt.add(hours=3).naive()
     )
+    # start_value snapshots the previous run's last_value (h2.naive())
+    assert (
+        resource.state["incremental"]["updated_at"]["start_value"]
+        == pendulum_start_dt.add(hours=2).naive()
+    )
 
     # end value tz-awareness conflict
     with pytest.raises(ConfigurationValueError):
@@ -2012,6 +2226,11 @@ def test_timezone_naive_datetime(item_type: TestDataItemFormat) -> None:
     assert resource.state["incremental"]["updated_at"]["last_value"] == pendulum_start_dt.add(
         hours=5
     )
+    # start_value snapshots the previous run's last_value (h4.naive(), preserved as raw)
+    assert (
+        resource.state["incremental"]["updated_at"]["start_value"]
+        == pendulum_start_dt.add(hours=4).naive()
+    )
 
     # switch from UTC to naive
     resource = some_data(max_hours=4, tz="UTC").with_name("copy_5")  # also make new resource state
@@ -2040,6 +2259,10 @@ def test_timezone_naive_datetime(item_type: TestDataItemFormat) -> None:
     assert (
         resource.state["incremental"]["updated_at"]["last_value"]
         == pendulum_start_dt.add(hours=5).naive()
+    )
+    # start_value snapshots the previous run's last_value (h4 tz-aware, preserved as raw)
+    assert resource.state["incremental"]["updated_at"]["start_value"] == pendulum_start_dt.add(
+        hours=4
     )
 
 
@@ -2172,6 +2395,13 @@ def test_load_with_end_value_does_not_write_state(item_type: TestDataItemFormat)
 
     assert pipeline.state.get("sources") is None
 
+    # end_value path returns mock state — start_value must be present and equal to initial_value
+    inc = dlt.sources.incremental("updated_at", initial_value=20, end_value=30)
+    mock_state = inc.get_state()
+    assert mock_state["start_value"] == 20
+    assert mock_state["last_value"] == 20
+    assert mock_state["initial_value"] == 20
+
 
 @pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
 def test_end_value_initial_value_errors(item_type: TestDataItemFormat) -> None:
@@ -2299,6 +2529,29 @@ def test_out_of_range_flags(item_type: TestDataItemFormat) -> None:
     pipeline.extract(descending_single_item())
 
     pipeline.extract(ascending_single_item())
+
+
+@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
+def test_start_out_of_range_open_equals_start_value(item_type: TestDataItemFormat) -> None:
+    """start_out_of_range is set when row equals start_value with range_start='open'"""
+
+    @dlt.resource
+    def descending(
+        updated_at: dlt.sources.incremental[int] = dlt.sources.incremental(
+            "updated_at", initial_value=10, row_order="desc", range_start="open"
+        )
+    ) -> Any:
+        # descending from 12 down to 8, with value 10 == start_value
+        for i in [12, 11, 10, 9, 8]:
+            yield data_to_item_format(item_type, [{"updated_at": i}])
+            # 10 equals start_value and range_start="open" so it's out of range
+            if i <= 10:
+                assert updated_at.start_out_of_range is True
+
+    # early stopping should close the generator when row_order="desc"
+    data = list(descending)
+    # only 12 and 11 are > 10 (open range excludes 10)
+    assert data_item_length(data) == 2
 
 
 @pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
@@ -2567,6 +2820,11 @@ def test_get_incremental_value_type(item_type: TestDataItemFormat) -> None:
     # typing has precedence
     assert dlt.sources.incremental[pendulum.DateTime]("id", initial_value=1).get_incremental_value_type() is pendulum.DateTime  # type: ignore[arg-type]
 
+    # context with allow_external_schedulers=False overrides per-incremental True so the
+    # join path is skipped entirely; this lets the resource bodies below test type
+    # inference without triggering ExternalSchedulerNotAvailable
+    no_join_ctx = TimeIntervalContext(allow_external_schedulers=False)
+
     # pass default value
     @dlt.resource
     def test_type(
@@ -2577,8 +2835,9 @@ def test_get_incremental_value_type(item_type: TestDataItemFormat) -> None:
         data = [{"updated_at": d} for d in [1, 2, 3]]
         yield data_to_item_format(item_type, data)
 
-    r = test_type()
-    list(r)
+    with Container().injectable_context(no_join_ctx):
+        r = test_type()
+        list(r)
     assert r.incremental.incremental.get_incremental_value_type() is str
 
     # use annotation
@@ -2591,8 +2850,9 @@ def test_get_incremental_value_type(item_type: TestDataItemFormat) -> None:
         data = [{"updated_at": d} for d in [1, 2, 3]]
         yield data_to_item_format(item_type, data)
 
-    r = test_type_2()
-    list(r)
+    with Container().injectable_context(no_join_ctx):
+        r = test_type_2()
+        list(r)
     assert r.incremental.incremental.get_incremental_value_type() is int
 
     # pass in explicit value
@@ -2601,10 +2861,11 @@ def test_get_incremental_value_type(item_type: TestDataItemFormat) -> None:
         data = [{"updated_at": d} for d in [1, 2, 3]]
         yield data_to_item_format(item_type, data)
 
-    r = test_type_3(
-        dlt.sources.incremental[float]("updated_at", allow_external_schedulers=True)  # type: ignore[arg-type]
-    )
-    list(r)
+    with Container().injectable_context(no_join_ctx):
+        r = test_type_3(
+            dlt.sources.incremental[float]("updated_at", allow_external_schedulers=True)  # type: ignore[arg-type]
+        )
+        list(r)
     assert r.incremental.incremental.get_incremental_value_type() is float
 
     # pass explicit value overriding default that is typed
@@ -2637,115 +2898,6 @@ def test_get_incremental_value_type(item_type: TestDataItemFormat) -> None:
     assert r.incremental.incremental.allow_external_schedulers is False
     # any will be ignored when merging explicit instance with default
     assert r.incremental.incremental.get_incremental_value_type() is int
-
-
-@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
-def test_join_env_scheduler(item_type: TestDataItemFormat) -> None:
-    @dlt.resource
-    def test_type_2(
-        updated_at: dlt.sources.incremental[int] = dlt.sources.incremental(
-            "updated_at", allow_external_schedulers=True
-        )
-    ):
-        data = [{"updated_at": d} for d in [1, 2, 3]]
-        yield data_to_item_format(item_type, data)
-
-    result = list(test_type_2())
-    assert data_item_to_list(item_type, result) == [
-        {"updated_at": 1},
-        {"updated_at": 2},
-        {"updated_at": 3},
-    ]
-
-    # set start and end values
-    os.environ["DLT_START_VALUE"] = "2"
-    result = list(test_type_2())
-    assert data_item_to_list(item_type, result) == [{"updated_at": 2}, {"updated_at": 3}]
-    os.environ["DLT_END_VALUE"] = "3"
-    result = list(test_type_2())
-    assert data_item_to_list(item_type, result) == [{"updated_at": 2}]
-
-
-@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
-def test_join_env_scheduler_pipeline(item_type: TestDataItemFormat) -> None:
-    @dlt.resource
-    def test_type_2(
-        updated_at: dlt.sources.incremental[int] = dlt.sources.incremental(
-            "updated_at", allow_external_schedulers=True
-        )
-    ):
-        data = [{"updated_at": d} for d in [1, 2, 3]]
-        yield data_to_item_format(item_type, data)
-
-    pip_1_name = "incremental_" + uniq_id()
-    pipeline = dlt.pipeline(pipeline_name=pip_1_name, destination="duckdb")
-    r = test_type_2()
-    r.add_step(AssertItems([{"updated_at": 2}, {"updated_at": 3}], item_type))
-    os.environ["DLT_START_VALUE"] = "2"
-    pipeline.extract(r)
-    # state is saved next extract has no items
-    r = test_type_2()
-    r.add_step(AssertItems([]))
-    pipeline.extract(r)
-
-    # setting end value will stop using state
-    os.environ["DLT_END_VALUE"] = "3"
-    r = test_type_2()
-    r.add_step(AssertItems([{"updated_at": 2}], item_type))
-    pipeline.extract(r)
-    r = test_type_2()
-    os.environ["DLT_START_VALUE"] = "1"
-    r.add_step(AssertItems([{"updated_at": 1}, {"updated_at": 2}], item_type))
-    pipeline.extract(r)
-
-
-@pytest.mark.parametrize("item_type", ALL_TEST_DATA_ITEM_FORMATS)
-def test_allow_external_schedulers(item_type: TestDataItemFormat) -> None:
-    @dlt.resource()
-    def test_type_2(
-        updated_at: dlt.sources.incremental[int] = dlt.sources.incremental("updated_at"),
-    ):
-        data = [{"updated_at": d} for d in [1, 2, 3]]
-        yield data_to_item_format(item_type, data)
-
-    # does not participate
-    os.environ["DLT_START_VALUE"] = "2"
-    # r = test_type_2()
-    # result = data_item_to_list(item_type, list(r))
-    # assert len(result) == 3
-
-    # # incremental not bound to the wrapper
-    # assert test_type_2.incremental.allow_external_schedulers is None
-    # assert test_type_2().incremental.allow_external_schedulers is None
-    # # this one is bound
-    # assert r.incremental.allow_external_schedulers is False
-
-    # # allow scheduler in wrapper
-    # r = test_type_2()
-    # r.incremental.allow_external_schedulers = True
-    # result = data_item_to_list(item_type, list(r))
-    # assert len(result) == 2
-    # assert r.incremental.allow_external_schedulers is True
-    # assert r.incremental.incremental.allow_external_schedulers is True
-
-    # add incremental dynamically
-    @dlt.resource()
-    def test_type_3():
-        data = [{"updated_at": d} for d in [1, 2, 3]]
-        yield data_to_item_format(item_type, data)
-
-    r = test_type_3()
-    r.add_step(dlt.sources.incremental[int]("updated_at"))
-    r.incremental.allow_external_schedulers = True
-    result = data_item_to_list(item_type, list(r))
-    assert len(result) == 2
-
-    # if type of incremental cannot be inferred, external scheduler will be ignored
-    r = test_type_3()
-    r.add_step(dlt.sources.incremental("updated_at"))
-    r.incremental.allow_external_schedulers = True
-    result = data_item_to_list(item_type, list(r))
-    assert len(result) == 3
 
 
 @pytest.mark.parametrize("yield_pydantic", (True, False))
@@ -4199,9 +4351,14 @@ def test_start_range_open_no_deduplication(item_type: TestDataItemFormat) -> Non
 
 def test_primary_key_disables_deduplication() -> None:
     incremental = dlt.sources.incremental[int]("updated_at")
-    incremental._cached_state = {"unique_hashes": [], "initial_value": None, "last_value": None}
+    incremental._cached_state = {
+        "unique_hashes": [],
+        "initial_value": None,
+        "last_value": None,
+        "start_value": None,
+    }
     assert incremental._get_transform({}).boundary_deduplication is True
-    incremental.primary_key = ()
+    incremental.set_deduplication_key((), False)
     assert incremental._get_transform({}).boundary_deduplication is False
 
 
@@ -4409,20 +4566,13 @@ def test_custom_metrics_in_incremental() -> None:
             "resource_with_metrics"
         ]
         assert resource_metrics.custom_metrics["from_resource"] == "hey"
-        assert resource_metrics.custom_metrics["unfiltered_items_count"] == unfiltered_items_count
-        assert (
-            resource_metrics.custom_metrics["unfiltered_batches_count"] == unfiltered_batches_count
-        )
+        inc = resource_metrics.custom_metrics["incremental"][0]
+        assert inc["unfiltered_items_count"] == unfiltered_items_count
+        assert inc["unfiltered_batches_count"] == unfiltered_batches_count
         # NOTE: initial_unique_hashes_count is always last value in pipeline state,
         # so it persists across different incremental instances
-        assert (
-            resource_metrics.custom_metrics["initial_unique_hashes_count"]
-            == initial_unique_hashes_count
-        )
-        assert (
-            resource_metrics.custom_metrics["final_unique_hashes_count"]
-            == final_unique_hashes_count
-        )
+        assert inc["initial_unique_hashes_count"] == initial_unique_hashes_count
+        assert inc["final_unique_hashes_count"] == final_unique_hashes_count
         assert p.last_trace.last_normalize_info.row_counts.get("items") == last_normalized_count
 
     def _run_with_items(items: TDataItems, as_batch: bool) -> str:
@@ -4480,3 +4630,218 @@ def test_custom_metrics_in_incremental() -> None:
     # None items should increment unfiltered_items_count
     load_id = _run_with_items([None, None, {"id": 9, "value": "9"}], True)
     _assert_custom_metrics(load_id, 12, 6, 1, 1, 1)
+
+
+def test_incremental_hints_in_extract_trace() -> None:
+    """Verify that incremental configuration is correctly stored in extract
+    trace hints for first run, subsequent run, run with end_value, and
+    resource refresh run."""
+    call_no = 0
+
+    @dlt.resource(table_name="items", primary_key="id")
+    def some_data(
+        updated_at=dlt.sources.incremental("updated_at", initial_value=1),
+    ):
+        nonlocal call_no
+        call_no += 1
+        yield [
+            {"id": call_no * 10 + 1, "updated_at": call_no * 10 + 2},
+            {"id": call_no * 10 + 2, "updated_at": call_no * 10 + 3},
+        ]
+
+    # yields static data so all items get filtered on second run
+    @dlt.resource(table_name="items", primary_key="id")
+    def static_data(
+        updated_at=dlt.sources.incremental("updated_at", initial_value=1),
+    ):
+        yield [{"id": 1, "updated_at": 2}, {"id": 2, "updated_at": 3}]
+
+    p = dlt.pipeline(pipeline_name="p_hints_" + uniq_id(), destination="duckdb")
+
+    def _get_incremental_hint(resource_name: str = "some_data") -> Dict[str, Any]:
+        extract_info = p.last_trace.last_extract_info
+        load_id = list(extract_info.metrics.keys())[0]
+        return extract_info.metrics[load_id][0]["hints"][resource_name]["incremental"]
+
+    # 1. first run: initial_value=1, no end_value, no prior state
+    p.run(some_data)
+    inc_hint = _get_incremental_hint()
+    assert inc_hint["cursor_path"] == "updated_at"
+    assert inc_hint["initial_value"] == 1
+    assert inc_hint["end_value"] is None
+    assert inc_hint["range_start"] == "closed"
+    assert inc_hint["range_end"] == "open"
+    assert inc_hint["lag"] is None
+    assert inc_hint["allow_external_schedulers"] is False
+
+    # 2. subsequent run: initial_value stays as configured (state is separate)
+    p.run(some_data)
+    inc_hint = _get_incremental_hint()
+    assert inc_hint["cursor_path"] == "updated_at"
+    assert inc_hint["initial_value"] == 1
+    assert inc_hint["end_value"] is None
+
+    # 3. run with end_value set
+    some_data_with_end = some_data()
+    some_data_with_end.apply_hints(
+        incremental=dlt.sources.incremental("updated_at", initial_value=1, end_value=100)
+    )
+    p.run(some_data_with_end)
+    inc_hint = _get_incremental_hint()
+    assert inc_hint["cursor_path"] == "updated_at"
+    assert inc_hint["initial_value"] == 1
+    assert inc_hint["end_value"] == 100
+    assert inc_hint["range_start"] == "closed"
+    assert inc_hint["range_end"] == "open"
+
+    # 4. resource refresh run (drop_resources resets state)
+    p.run(some_data, refresh="drop_resources")
+    inc_hint = _get_incremental_hint()
+    assert inc_hint["cursor_path"] == "updated_at"
+    assert inc_hint["initial_value"] == 1
+    assert inc_hint["end_value"] is None
+
+    # 5. no new data: all items filtered by incremental, nothing loaded
+    #    but hints are still present in extract metrics
+    p.run(static_data)
+    assert p.last_trace.last_extract_info.metrics
+    # second run yields same items — all filtered out
+    load_info = p.run(static_data)
+    assert load_info.loads_ids == []
+    inc_hint = _get_incremental_hint("static_data")
+    assert inc_hint["cursor_path"] == "updated_at"
+    assert inc_hint["initial_value"] == 1
+    assert inc_hint["end_value"] is None
+    # resource is still recorded in metrics (items_count=0) when filter excludes everything
+    extract_info = p.last_trace.last_extract_info
+    load_id = list(extract_info.metrics.keys())[0]
+    resource_metrics = extract_info.metrics[load_id][0]["resource_metrics"]
+    assert "static_data" in resource_metrics
+    assert resource_metrics["static_data"].items_count == 0
+
+
+def test_decorator_incremental_fallback_none_default() -> None:
+    """@dlt.resource(incremental=...) used as fallback when param default is None."""
+
+    @dlt.resource(
+        incremental=dlt.sources.incremental(
+            "updated_at", initial_value="2024-01-01T00:00:00Z", allow_external_schedulers=True
+        )
+    )
+    def fallback_test(
+        updated_at: dlt.sources.incremental[str] = None,
+    ):
+        yield {"updated_at": "2024-01-15T12:00:00Z", "state": updated_at.get_state()}
+
+    # ctx.allow_external_schedulers=False overrides the per-incremental True so the join
+    # path is skipped — this test verifies decorator->param fallback, not scheduler join
+    with Container().injectable_context(TimeIntervalContext(allow_external_schedulers=False)):
+        r = fallback_test()
+        items = list(r)
+
+    assert len(items) == 1
+    state = items[0]["state"]
+    # all fields from decorator's incremental
+    assert r.incremental._incremental.cursor_path == "updated_at"
+    assert r.incremental._incremental.allow_external_schedulers is True
+    assert state["initial_value"] == "2024-01-01T00:00:00Z"
+    # type from annotation [str]
+    assert r.incremental._incremental.get_incremental_value_type() is str
+
+
+def test_decorator_incremental_with_default_param() -> None:
+    """When param has its own Incremental default, that wins over decorator."""
+
+    @dlt.resource(
+        incremental=dlt.sources.incremental(
+            "updated_at", initial_value="2020-01-01", allow_external_schedulers=True
+        )
+    )
+    def default_test(
+        updated_at: dlt.sources.incremental[str] = dlt.sources.incremental(
+            "updated_at", initial_value="2024-01-01"
+        ),
+    ):
+        yield {"updated_at": "2024-06-15", "state": updated_at.get_state()}
+
+    r = default_test()
+    items = list(r)
+
+    assert len(items) == 1
+    state = items[0]["state"]
+    # param default wins: initial_value from param, not decorator
+    assert state["initial_value"] == "2024-01-01"
+    # allow_external_schedulers from param default (False), not decorator (True)
+    assert r.incremental._incremental.allow_external_schedulers is False
+
+
+def test_decorator_incremental_config_value_resolves_independently() -> None:
+    """dlt.config.value default resolves from config, decorator not consulted."""
+
+    @dlt.resource(incremental=dlt.sources.incremental("updated_at", allow_external_schedulers=True))
+    def config_test(
+        updated_at: dlt.sources.incremental[str] = dlt.config.value,
+    ):
+        yield {"updated_at": "2024-06-15", "state": updated_at.get_state()}
+
+    os.environ["UPDATED_AT__CURSOR_PATH"] = "updated_at"
+    os.environ["UPDATED_AT__INITIAL_VALUE"] = "2024-01-01"
+    try:
+        r = config_test()
+        items = list(r)
+    finally:
+        del os.environ["UPDATED_AT__CURSOR_PATH"]
+        del os.environ["UPDATED_AT__INITIAL_VALUE"]
+
+    assert len(items) == 1
+    state = items[0]["state"]
+    # config provides cursor_path and initial_value
+    assert r.incremental._incremental.cursor_path == "updated_at"
+    assert state["initial_value"] == "2024-01-01"
+    # config did NOT provide allow_external_schedulers — default False, NOT decorator's True
+    assert r.incremental._incremental.allow_external_schedulers is False
+
+
+def test_decorator_incremental_type_from_annotation() -> None:
+    """Cursor type comes from annotation even when decorator's incremental is untyped."""
+
+    @dlt.resource(incremental=dlt.sources.incremental("updated_at"))
+    def typed_test(
+        updated_at: dlt.sources.incremental[int] = None,
+    ):
+        yield {"updated_at": 42}
+
+    r = typed_test()
+    list(r)
+    # type from annotation [int], not from decorator (Any)
+    assert r.incremental._incremental.get_incremental_value_type() is int
+
+
+def test_decorator_incremental_type_from_explicit_arg() -> None:
+    """Explicit arg's type wins over annotation."""
+
+    @dlt.resource(incremental=dlt.sources.incremental("updated_at"))
+    def explicit_test(
+        updated_at: dlt.sources.incremental[int] = None,
+    ):
+        yield {"updated_at": 1.5}
+
+    r = explicit_test(updated_at=dlt.sources.incremental[float]("updated_at"))  # type: ignore[arg-type]
+    list(r)
+    # explicit arg's [float] wins over annotation [int]
+    assert r.incremental._incremental.get_incremental_value_type() is float
+
+
+def test_decorator_incremental_type_from_typed_default() -> None:
+    """Typed param default wins over untyped decorator incremental."""
+
+    @dlt.resource(incremental=dlt.sources.incremental("updated_at"))
+    def default_typed_test(
+        updated_at=dlt.sources.incremental[str]("updated_at"),  # noqa: B008
+    ):
+        yield {"updated_at": "2024-01-01"}
+
+    r = default_typed_test()
+    list(r)
+    # type from typed default [str]
+    assert r.incremental._incremental.get_incremental_value_type() is str

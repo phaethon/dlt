@@ -1,7 +1,7 @@
 import base64
 import gzip
-from datetime import datetime, date, time  # noqa: I251
-from pendulum.tz import UTC
+import uuid
+from datetime import time  # noqa: I251
 from typing import (
     Any,
     Dict,
@@ -33,14 +33,14 @@ try:
     import pyarrow
     import pyarrow.parquet
     import pyarrow.compute
-    import pyarrow.dataset
     from pyarrow.parquet import ParquetFile
     from pyarrow import Table
 except ModuleNotFoundError:
     raise MissingDependencyException(
         "dlt pyarrow helpers",
         [f"{version.DLT_PKG_NAME}[parquet]"],
-        "Install pyarrow to be allow to load arrow tables, panda frames and to use parquet files.",
+        "Install pyarrow to be allowed to load arrow tables, pandas DataFrames and to use parquet"
+        " files.",
     )
 
 import ctypes
@@ -48,6 +48,7 @@ import ctypes
 TAnyArrowItem = Union[pyarrow.Table, pyarrow.RecordBatch]
 
 ARROW_DECIMAL_MAX_PRECISION = 76
+ARROW_UUID_EXTENSION_NAME = "arrow.uuid"
 
 
 class UnsupportedArrowTypeException(DltException):
@@ -346,7 +347,7 @@ def get_column_type_from_py_arrow(dtype: pyarrow.DataType) -> TColumnType:
         # dictates the "logical" type. We simply delegate to the underlying value_type.
         return get_column_type_from_py_arrow(dtype.value_type)
     elif pyarrow.types.is_null(dtype):
-        return {"x-normalizer": {"seen-null-first": True}}  # type: ignore[typeddict-unknown-key]
+        return {}  # incomplete column, no data_type
     else:
         raise UnsupportedArrowTypeException(arrow_type=dtype)
 
@@ -402,10 +403,14 @@ def deserialize_type(type_str: str) -> pyarrow.DataType:
 
 
 def remove_null_columns(item: TAnyArrowItem) -> TAnyArrowItem:
-    """Remove all columns of datatype pyarrow.null() from the table or record batch"""
-    return remove_columns(
-        item, [field.name for field in item.schema if pyarrow.types.is_null(field.type)]
-    )
+    """Remove all columns of datatype pyarrow.null() from the table or record batch.
+    Stores removed column names in arrow schema metadata under 'dlt.null_columns' key.
+    """
+    null_col_names = [field.name for field in item.schema if pyarrow.types.is_null(field.type)]
+    if not null_col_names:
+        return item
+    item = remove_columns(item, null_col_names)
+    return add_arrow_metadata(item, {"dlt.null_columns": json.dumps(null_col_names)})
 
 
 def remove_null_columns_from_schema(schema: pyarrow.Schema) -> Tuple[pyarrow.Schema, bool]:
@@ -611,8 +616,10 @@ def normalize_py_arrow_item(
         new_fields.append(schema.field(idx).with_name(column_name))
         new_columns.append(item.column(idx))
 
-    # create desired type
-    return item.__class__.from_arrays(new_columns, schema=pyarrow.schema(new_fields))
+    # preserve schema metadata (e.g. dlt.null_columns) through normalization rebuild
+    return item.__class__.from_arrays(
+        new_columns, schema=pyarrow.schema(new_fields, metadata=item.schema.metadata)
+    )
 
 
 def should_normalize_py_arrow_item_column(
@@ -703,6 +710,11 @@ def add_dlt_load_id_column(
         "UTC",  # ts is irrelevant to get pyarrow string, but it's required...
     )
 
+    # Check if destination supports dictionary encoding (default True if not specified)
+    use_dictionary = True
+    if caps.parquet_format is not None:
+        use_dictionary = caps.parquet_format.supports_dictionary_encoding
+
     # add the column with the new value at previous index or append
     item = add_constant_column(
         item=item,
@@ -715,6 +727,7 @@ def add_dlt_load_id_column(
             else dlt_load_id_column()["nullable"]
         ),
         index=idx,
+        use_dictionary=use_dictionary,
     )
 
     return item
@@ -735,6 +748,28 @@ def get_normalized_arrow_fields_mapping(schema: pyarrow.Schema, naming: NamingCo
     return name_mapping
 
 
+def dlt_column_to_arrow_field(
+    column: TColumnSchema,
+    caps: DestinationCapabilitiesContext,
+    timestamp_timezone: str = "UTC",
+) -> pyarrow.Field:
+    """Convert a single dlt column schema to a PyArrow field.
+
+    Args:
+        column (TColumnSchema): dlt column schema with at least `name` and `data_type`.
+        caps (DestinationCapabilitiesContext): Destination capabilities for type mapping.
+        timestamp_timezone (str): Timezone for timestamp columns.
+
+    Returns:
+        pyarrow.Field: Corresponding PyArrow field.
+    """
+    return pyarrow.field(
+        column["name"],
+        get_py_arrow_datatype(column, caps, timestamp_timezone),
+        nullable=column.get("nullable", True),
+    )
+
+
 def columns_to_arrow(
     columns: TTableSchemaColumns,
     caps: DestinationCapabilitiesContext,
@@ -752,17 +787,9 @@ def columns_to_arrow(
     caps = caps or DestinationCapabilitiesContext.generic_capabilities()
     return pyarrow.schema(
         [
-            pyarrow.field(
-                name,
-                get_py_arrow_datatype(
-                    schema_item,
-                    caps,
-                    timestamp_timezone,
-                ),
-                nullable=schema_item.get("nullable", True),
-            )
-            for name, schema_item in columns.items()
-            if schema_item.get("data_type") is not None
+            dlt_column_to_arrow_field(column, caps, timestamp_timezone)
+            for column in columns.values()
+            if column.get("data_type") is not None
         ]
     )
 
@@ -805,6 +832,7 @@ def add_constant_column(
     value: Any = None,
     nullable: bool = True,
     index: int = -1,
+    use_dictionary: bool = True,
 ) -> TAnyArrowItem:
     """Add column with a single value to the table.
 
@@ -815,26 +843,32 @@ def add_constant_column(
         nullable: Whether the new column is nullable
         value: The value to fill the new column with
         index: The index at which to insert the new column. Defaults to -1 (append)
+        use_dictionary: When True (default), creates a dictionary-encoded column which is
+            memory-efficient for repeated values. Set to False for destinations that don't
+            support dictionary types (e.g., ADBC drivers for MSSQL).
     Note:
-        This function creates a dictionary field for the new column, which is memory-efficient
-        when the column contains a single repeated value.
-        The column is created as a DictionaryArray with int8 indices.
+        When use_dictionary=True, the column is created as a DictionaryArray with int8 indices.
+        When use_dictionary=False, a regular array filled with the repeated value is created.
     """
-    dictionary = pyarrow.array([value], type=data_type)
-    zero_buffer = pyarrow.allocate_buffer(item.num_rows, resizable=False)
-    ctypes.memset(zero_buffer.address, 0, item.num_rows)
+    if use_dictionary:
+        dictionary = pyarrow.array([value], type=data_type)
+        zero_buffer = pyarrow.allocate_buffer(item.num_rows, resizable=False)
+        ctypes.memset(zero_buffer.address, 0, item.num_rows)
 
-    indices = pyarrow.Array.from_buffers(
-        pyarrow.int8(),
-        item.num_rows,
-        [None, zero_buffer],  # None validity bitmap means arrow assumes all entries are valid
-    )
-    dict_array = pyarrow.DictionaryArray.from_arrays(indices, dictionary)
+        indices = pyarrow.Array.from_buffers(
+            pyarrow.int8(),
+            item.num_rows,
+            [None, zero_buffer],  # None validity bitmap means arrow assumes all entries are valid
+        )
+        column_array = pyarrow.DictionaryArray.from_arrays(indices, dictionary)
+    else:
+        # Create a regular array filled with the repeated value
+        column_array = pyarrow.repeat(pyarrow.scalar(value, type=data_type), item.num_rows)
 
-    field = pyarrow.field(name, dict_array.type, nullable=nullable)
+    field = pyarrow.field(name, column_array.type, nullable=nullable)
     if index == -1:
-        return item.append_column(field, dict_array)
-    return item.add_column(index, field, dict_array)
+        return item.append_column(field, column_array)
+    return item.add_column(index, field, column_array)
 
 
 def pq_stream_with_new_columns(
@@ -890,10 +924,15 @@ def cast_arrow_schema_types(
 
 
 def concat_batches_and_tables_in_order(
-    tables_or_batches: Iterable[Union[pyarrow.Table, pyarrow.RecordBatch]]
+    tables_or_batches: Iterable[Union[pyarrow.Table, pyarrow.RecordBatch]],
+    promote_options: str = "none",
 ) -> pyarrow.Table:
-    """Concatenate iterable of tables and batches into a single table, preserving row order. Zero copy is used during
-    concatenation so schemas must be identical.
+    """Concatenate iterable of tables and batches into a single table, preserving row order.
+
+    Args:
+        promote_options: PyArrow concat_tables promote_options. "none" (default) requires identical
+            schemas and enables zero-copy concat. "default" promotes within type families (e.g.
+            int32→int64). "permissive" promotes across families (e.g. int64→double).
     """
     batches = []
     tables = []
@@ -909,8 +948,8 @@ def concat_batches_and_tables_in_order(
             raise ValueError(f"Unsupported type: `{type(item)}`")
     if batches:
         tables.append(pyarrow.Table.from_batches(batches))
-    # "none" option ensures 0 copy concat
-    return pyarrow.concat_tables(tables, promote_options="none")
+    # "none" ensures 0 copy concat; "default"/"permissive" allow type promotion
+    return pyarrow.concat_tables(tables, promote_options=promote_options)
 
 
 def transpose_rows_to_columns(
@@ -941,6 +980,63 @@ def transpose_rows_to_columns(
         column_name: data.ravel()
         for column_name, data in zip(column_names, np.vsplit(pivoted_rows, len(pivoted_rows)))
     }
+
+
+def uuid_to_string(arr: Any) -> Any:  # pyarrow.Array -> pyarrow.Array
+    """Convert an array of UUIDs to canonical hyphenated lowercase string array.
+
+    Accepts a `pa.uuid()` extension array or a `fixed_size_binary[16]`. Nulls
+    are preserved. Sliced inputs (`storage.offset != 0`) are supported. Falls
+    back to pure Python if numpy is missing or the input is sliced.
+    """
+    pa = pyarrow
+
+    # accept extension arrays (pa.uuid()) and plain fixed_size_binary[16]
+    storage = arr.storage if hasattr(arr, "storage") else arr
+    n = len(storage)
+
+    try:
+        from dlt.common.libs.numpy import numpy as np
+    except MissingDependencyException:
+        np = None
+
+    # the numpy fast path reads `buffers()[1]` from byte 0 and reuses
+    # `buffers()[0]` (bit-packed validity) as-is — both wrong when the input is
+    # sliced. iterating `for scalar in storage` honors `storage.offset`, so the
+    # pure-python path is correct for sliced inputs as well.
+    if np is None or storage.offset != 0:
+        # `str(UUID)` is canonical lowercase hyphenated per RFC 4122,
+        # byte-identical to the numpy path's output.
+        return pa.array(
+            [
+                None if scalar.as_py() is None else str(uuid.UUID(bytes=scalar.as_py()))
+                for scalar in storage
+            ],
+            type=pa.string(),
+        )
+
+    if n == 0:
+        return pa.array([], type=pa.string())
+
+    # `bytes.hex()` is lowercase per the Python spec; the slice positions and
+    # hyphen placements below match `str(UUID)` exactly so both paths produce
+    # identical output.
+    raw = storage.buffers()[1].to_pybytes()  # 16*n contiguous bytes
+    hexbuf = np.frombuffer(raw.hex().encode("ascii"), dtype=np.uint8).reshape(n, 32)
+    out = np.full((n, 36), ord("-"), dtype=np.uint8)
+    out[:, 0:8] = hexbuf[:, 0:8]
+    out[:, 9:13] = hexbuf[:, 8:12]
+    out[:, 14:18] = hexbuf[:, 12:16]
+    out[:, 19:23] = hexbuf[:, 16:20]
+    out[:, 24:36] = hexbuf[:, 20:32]
+
+    # reuse storage's validity buffer (None if all valid). Output bytes are
+    # pure ASCII so the cast to string can never fail, even if null slots in
+    # the source data buffer contain garbage.
+    fsb36 = pa.FixedSizeBinaryArray.from_buffers(
+        pa.binary(36), n, [storage.buffers()[0], pa.py_buffer(out.tobytes())]
+    )
+    return fsb36.cast(pa.string())
 
 
 def convert_numpy_to_arrow(
@@ -975,6 +1071,10 @@ def convert_numpy_to_arrow(
     try:
         # type=None lets pyarrow infer the type from the data
         inferred_array = pa.array(column_data, type=inferred_arrow_type)
+        # pyarrow >=24 infers UUIDs as the `arrow.uuid` extension; coerce to string
+        # so destinations see canonical hyphenated text, matching pyarrow <24 behavior
+        if inferred_array is not None and _is_arrow_uuid_extension(inferred_array.type):
+            inferred_array = uuid_to_string(inferred_array)
     # detailed error handling should happen in fallback cases
     except (pa.ArrowInvalid, pyarrow.ArrowTypeError):
         logger.warning(
@@ -1050,34 +1150,44 @@ def convert_numpy_to_arrow(
         try:
             inferred_array = pa.array(column_data)
         except (pa.ArrowInvalid, pyarrow.ArrowTypeError) as e:
-            logger.warning(
-                f"Type can't be inferred by `pyarrow` {e.args[0]}. Values will be encoded as in a"
-                " loop, slowing extraction."
-            )
-            encoded_values: list[Union[None, Mapping[Any, Any], Sequence[Any], str]] = []
-            for value in column_data:
-                if value is None:
-                    encoded_values.append(None)
-                    continue
-                try:
-                    # the 3 types match those supported by `map_nested_in_place()`
-                    if isinstance(value, (tuple, dict, list)):
-                        encoded_value = map_nested_values_in_place(custom_encode, value)
-                    # convert set to list
-                    elif isinstance(value, set):
-                        encoded_value = map_nested_values_in_place(custom_encode, list(value))
-                    # no nesting
-                    else:
-                        encoded_value = custom_encode(value)  # type: ignore[assignment]
-                    encoded_values.append(encoded_value)
-                except TypeError as e:
-                    raise PyToArrowConversionException(
-                        data_type=dlt_data_type,
-                        inferred_arrow_type=inferred_arrow_type,
-                        details="dlt failed to encode values to an Arrow-compatible type.",
-                    ) from e
+            # UUID fast path — pyarrow <24 doesn't recognize `uuid.UUID` at
+            # inference; build fixed_size_binary[16] from `.bytes` and use the
+            # vectorized formatter instead of the slower per-row loop below.
+            if _first_non_none((uuid.UUID,)):
+                fsb = pa.array(
+                    [u.bytes if u is not None else None for u in column_data],
+                    type=pa.binary(16),
+                )
+                inferred_array = uuid_to_string(fsb)
+            else:
+                logger.warning(
+                    f"Type can't be inferred by `pyarrow` {e.args[0]}. Values will be encoded as"
+                    " in a loop, slowing extraction."
+                )
+                encoded_values: list[Union[None, Mapping[Any, Any], Sequence[Any], str]] = []
+                for value in column_data:
+                    if value is None:
+                        encoded_values.append(None)
+                        continue
+                    try:
+                        # the 3 types match those supported by `map_nested_in_place()`
+                        if isinstance(value, (tuple, dict, list)):
+                            encoded_value = map_nested_values_in_place(custom_encode, value)
+                        # convert set to list
+                        elif isinstance(value, set):
+                            encoded_value = map_nested_values_in_place(custom_encode, list(value))
+                        # no nesting
+                        else:
+                            encoded_value = custom_encode(value)  # type: ignore[assignment]
+                        encoded_values.append(encoded_value)
+                    except TypeError as e:
+                        raise PyToArrowConversionException(
+                            data_type=dlt_data_type,
+                            inferred_arrow_type=inferred_arrow_type,
+                            details="dlt failed to encode values to an Arrow-compatible type.",
+                        ) from e
 
-            inferred_array = pa.array(encoded_values)
+                inferred_array = pa.array(encoded_values)
 
     return inferred_array
 
@@ -1332,7 +1442,7 @@ def row_tuples_to_arrow(
         # TODO if converting to arrow fail, should we raise or skip column?
         except PyToArrowConversionException as e:
             e.field_name = column_name
-            raise e
+            raise
 
         field = pa.field(
             name=column_name, type=arrow_array.type, nullable=column_schema.get("nullable", True)
@@ -1405,7 +1515,7 @@ def cast_date64_columns_to_timestamp(tbl: pyarrow.Table, tz: Optional[str] = Non
     """
     Cast any date64 columns to timestamp with microsecond precision, preserving the
     semantic time values. Uses pyarrow.compute.cast on the column (works for chunked arrays)
-    and promotes precision from milliseconds (date64) to microseconds (timestamp[us]).
+    to cast from milliseconds (date64) to microseconds (timestamp[us]).
 
     Args:
         tbl: Input Arrow table.
@@ -1422,16 +1532,10 @@ def cast_date64_columns_to_timestamp(tbl: pyarrow.Table, tz: Optional[str] = Non
     for col, fld in zip(tbl.columns, tbl.schema):
         if pyarrow.types.is_date64(fld.type):
             changed = True
-            # promote to microseconds to avoid precision loss in downstream systems
             unit = "us"
             new_type = pyarrow.timestamp(unit, tz)
-            # reinterpret underlying 64-bit values without rescaling units
-            if isinstance(col, pyarrow.ChunkedArray):
-                new_chunks = [c.view(new_type) for c in col.chunks]
-                new_col = pyarrow.chunked_array(new_chunks)
-            else:
-                new_col = col.view(new_type)
-            arrays.append(new_col)
+            # Rescale from ms (date64) to us (timestamp).
+            arrays.append(pyarrow.compute.cast(col, new_type))
             fields.append(pyarrow.field(fld.name, new_type, fld.nullable, fld.metadata))
         else:
             arrays.append(col)
@@ -1442,3 +1546,10 @@ def cast_date64_columns_to_timestamp(tbl: pyarrow.Table, tz: Optional[str] = Non
 
     new_schema = pyarrow.schema(fields, metadata=tbl.schema.metadata)
     return pyarrow.Table.from_arrays(arrays, schema=new_schema)
+
+
+def _is_arrow_uuid_extension(arrow_type: Any) -> bool:
+    return (
+        isinstance(arrow_type, pyarrow.BaseExtensionType)
+        and arrow_type.extension_name == ARROW_UUID_EXTENSION_NAME
+    )

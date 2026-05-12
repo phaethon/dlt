@@ -1,4 +1,5 @@
 import contextlib
+import logging
 from http import HTTPStatus
 import http.server
 import multiprocessing
@@ -43,7 +44,33 @@ from dlt.common.storages.versioned_storage import VersionedStorage
 from dlt.common.typing import StrAny, TDataItem, PathLike
 from dlt.common.utils import set_working_dir
 
-TEST_STORAGE_ROOT = "_storage"
+
+DLT_TEST_STORAGE_ROOT = "DLT_TEST_STORAGE_ROOT"
+PYTEST_XDIST_WORKER = "PYTEST_XDIST_WORKER"
+STORAGE_ROOT_PREFIX = "_storage"
+
+
+def get_test_worker_id() -> str:
+    return os.environ.get(PYTEST_XDIST_WORKER, "gw0")
+
+
+def get_test_worker_idx() -> int:
+    worker_id = get_test_worker_id()
+    assert worker_id.startswith("gw")
+    return int(worker_id.removeprefix("gw"))
+
+
+def compute_test_storage_root() -> str:
+    return f"{STORAGE_ROOT_PREFIX}_{get_test_worker_id()}"
+
+
+def set_environment_test_storage_root(test_storage_root: str) -> None:
+    os.environ[DLT_TEST_STORAGE_ROOT] = test_storage_root
+
+
+def get_test_storage_root() -> str:
+    return os.environ.get(DLT_TEST_STORAGE_ROOT, f"{STORAGE_ROOT_PREFIX}_{get_test_worker_id()}")
+
 
 ALL_DESTINATIONS = dlt.config.get("ALL_DESTINATIONS", list) or [
     "duckdb",
@@ -57,6 +84,7 @@ IMPLEMENTED_DESTINATIONS = {
     "athena",
     "duckdb",
     "bigquery",
+    "fabric",
     "redshift",
     "postgres",
     "snowflake",
@@ -67,6 +95,7 @@ IMPLEMENTED_DESTINATIONS = {
     "mssql",
     "qdrant",
     "lancedb",
+    "lance",
     "destination",
     "synapse",
     "databricks",
@@ -81,6 +110,7 @@ NON_SQL_DESTINATIONS = {
     "dummy",
     "qdrant",
     "lancedb",
+    "lance",
     "destination",
 }
 
@@ -95,9 +125,12 @@ except ImportError:
 
 SQL_DESTINATIONS = IMPLEMENTED_DESTINATIONS - NON_SQL_DESTINATIONS
 
-# exclude destination configs (for now used for athena and athena iceberg separation)
+# exclude destination test configurations
 EXCLUDED_DESTINATION_CONFIGURATIONS = set(
     dlt.config.get("EXCLUDED_DESTINATION_CONFIGURATIONS", list) or set()
+)
+EXCLUDED_DESTINATION_TEST_CONFIGURATION_IDS = set(
+    dlt.config.get("EXCLUDED_DESTINATION_TEST_CONFIGURATION_IDS", list) or set()
 )
 
 
@@ -177,7 +210,7 @@ def write_version(storage: FileStorage, version: str) -> None:
 
 
 def delete_test_storage() -> None:
-    storage = FileStorage(TEST_STORAGE_ROOT)
+    storage = FileStorage(get_test_storage_root())
     if storage.has_folder(""):
         storage.delete_folder("", recursively=True, delete_ro=True)
 
@@ -202,7 +235,7 @@ def preserve_environ() -> Iterator[None]:
 
 @pytest.fixture(autouse=True)
 def auto_test_run_context() -> Iterator[None]:
-    """Creates a run context that points to TEST_STORAGE_ROOT (_storage)"""
+    """Creates a run context that points to get_test_storage_root()"""
     yield from create_test_run_context()
 
 
@@ -249,7 +282,7 @@ def create_test_run_context() -> Iterator[None]:
     # this plugs active context
     ctx = PluggableRunContext()
     mock = MockableRunContext.from_context(ctx.context)
-    mock._local_dir = os.path.abspath(TEST_STORAGE_ROOT)
+    mock._local_dir = os.path.abspath(get_test_storage_root())
     mock._global_dir = mock._data_dir = os.path.join(mock._local_dir, DOT_DLT)
     ctx_plug = Container()[PluggableRunContext]
     cookie = ctx_plug.push_context()
@@ -277,13 +310,13 @@ def _preserve_environ() -> Iterator[None]:
     try:
         yield
     finally:
-        environ.clear()
+        environ.clear()  # clear Python-level env vars
         environ.update(saved_environ)
         for key_, value_ in known_environ.items():
-            if value_ is not None or key_ not in environ:
-                environ[key_] = value_ or ""
+            if value_ is None:
+                os.unsetenv(key_)  # unset C-level env var
             else:
-                del environ[key_]
+                environ[key_] = value_
 
 
 @pytest.fixture(autouse=True)
@@ -345,12 +378,18 @@ class MockableRunContext(RunContext):
 
 @pytest.fixture(autouse=True)
 def auto_unload_modules() -> Iterator[None]:
-    """Unload all modules inspected in this tests"""
+    """Restore sys.modules to pre-test state: unload added modules, re-add removed ones."""
     prev_modules = dict(sys.modules)
-    yield
-    mod_diff = set(sys.modules.keys()) - set(prev_modules.keys())
-    for mod in mod_diff:
-        del sys.modules[mod]
+    try:
+        yield
+    finally:
+        # remove modules added during the test
+        for mod in set(sys.modules.keys()) - set(prev_modules.keys()):
+            del sys.modules[mod]
+        # restore modules removed during the test
+        for mod, module in prev_modules.items():
+            if mod not in sys.modules:
+                sys.modules[mod] = module
 
 
 @pytest.fixture(autouse=True)
@@ -359,14 +398,16 @@ def deactivate_pipeline(preserve_environ) -> Iterator[None]:
     container = Container()
     if container[PipelineContext].is_active():
         container[PipelineContext].deactivate()
-    yield
-    if container[PipelineContext].is_active():
-        # take existing pipeline
-        # NOTE: no more needed. test storage is wiped fully when test starts
-        # p = dlt.pipeline()
-        # p._wipe_working_folder()
-        # deactivate context
-        container[PipelineContext].deactivate()
+    try:
+        yield
+    finally:
+        if container[PipelineContext].is_active():
+            # take existing pipeline
+            # NOTE: no more needed. test storage is wiped fully when test starts
+            # p = dlt.pipeline()
+            # p._wipe_working_folder()
+            # deactivate context
+            container[PipelineContext].deactivate()
 
 
 @pytest.fixture(autouse=True)
@@ -519,7 +560,7 @@ def disable_temporary_telemetry() -> Iterator[None]:
 def clean_test_storage(
     init_normalize: bool = False, init_loader: bool = False, mode: str = "t"
 ) -> FileStorage:
-    storage = FileStorage(TEST_STORAGE_ROOT, mode, makedirs=True)
+    storage = FileStorage(get_test_storage_root(), mode, makedirs=True)
     storage.delete_folder("", recursively=True, delete_ro=True)
     storage.create_folder(".")
     if init_normalize:
@@ -542,10 +583,13 @@ def assert_no_dict_key_starts_with(d: StrAny, key_prefix: str) -> None:
     assert all(not key.startswith(key_prefix) for key in d.keys())
 
 
-def skip_if_not_active(destination: str) -> None:
-    assert destination in IMPLEMENTED_DESTINATIONS, f"Unknown skipped destination {destination}"
-    if destination not in ACTIVE_DESTINATIONS:
-        pytest.skip(f"{destination} not in ACTIVE_DESTINATIONS", allow_module_level=True)
+def skip_if_not_active(*destinations: str) -> None:
+    for destination in destinations:
+        assert destination in IMPLEMENTED_DESTINATIONS, f"Unknown skipped destination {destination}"
+    if all(d not in ACTIVE_DESTINATIONS for d in destinations):
+        pytest.skip(
+            f"{', '.join(destinations)} not in ACTIVE_DESTINATIONS", allow_module_level=True
+        )
 
 
 def is_running_in_github_fork() -> bool:
@@ -582,6 +626,11 @@ skipifgithubci = pytest.mark.skipif(
     is_running_in_github_ci(), reason="This test does not work on github CI"
 )
 
+skipifworktree = pytest.mark.skipif(
+    os.path.basename(os.path.abspath(".")) != "dlt",
+    reason="Test requires run dir to be 'dlt' (skipped in worktrees)",
+)
+
 
 @contextlib.contextmanager
 def reset_providers(settings_dir: str) -> Iterator[ConfigProvidersContainer]:
@@ -613,3 +662,17 @@ def _inject_providers(providers: List[ConfigProvider]) -> Iterator[ConfigProvide
         yield ctx
     finally:
         container[PluggableRunContext].providers = old_providers
+
+
+@contextlib.contextmanager
+def capture_dlt_logger(
+    caplog: pytest.LogCaptureFixture, level: int = logging.WARNING
+) -> Iterator[pytest.LogCaptureFixture]:
+    """Temporarily enables propagation on `dlt` logger so `caplog` can capture logs."""
+    dlt_logger = logging.getLogger("dlt")
+    dlt_logger.propagate = True
+    try:
+        with caplog.at_level(level, logger="dlt"):
+            yield caplog
+    finally:
+        dlt_logger.propagate = False

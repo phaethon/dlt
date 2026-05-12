@@ -92,7 +92,7 @@ Combined identifier is also a valid single identifier. Starting from
 Previously double underscores were contracted into single underscore. That
 prevented using data loaded by `dlt` as a data source without identifier modifications. `dlt` maintains backward compatibility for version >1.4.0 as follows:
 
-* All schemas stored locally or at destination will be migrated to backward compatible mode by setting a flag `use_break_path_on_normalize` ie.:
+* All schemas stored locally or at destination will be migrated to backward compatible mode by setting a flag `use_break_path_on_normalize` i.e.:
 ```yaml
 normalizers:
   names: dlt.common.normalizers.names.snake_case
@@ -153,7 +153,11 @@ You can pick from a few built-in naming conventions.
 * `direct` - case-sensitive, allows all Unicode characters, does not contract underscores.
 * `sql_cs_v1` - case-sensitive, generates SQL-safe identifiers.
 * `sql_ci_v1` - case-insensitive, generates SQL-safe lowercase identifiers.
+* `s3_tables` - extends `snake_case` to comply with S3 Tables [naming rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-buckets-naming.html#naming-rules-table).
 
+:::note
+When using the `s3_tables` naming convention, any leading underscores are removed from dataset and table names. Hence, `dlt` tables will be prefixed with `dlt_` instead of the usual `_dlt_`. For example, `_dlt_loads` will be `dlt_loads`.
+:::
 
 ### Ignore naming convention for `dataset_name`
 You control the dataset naming normalization separately. Set `enable_dataset_name_normalization` to `false` to ignore the naming convention for `dataset_name`:
@@ -210,7 +214,7 @@ import dlt
 dest_ = dlt.destinations.postgres(naming_convention="my_package.sql_cs_latin2")
 ```
 
-⛔ avoid this or you may get pickle errors ie. when using parallel normalization:
+⛔ avoid this or you may get pickle errors i.e. when using parallel normalization:
 ```py
 import dlt
 

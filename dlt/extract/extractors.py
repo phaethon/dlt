@@ -1,6 +1,6 @@
 from copy import copy
 from functools import lru_cache, partial
-from typing import Set, Dict, Any, Optional, List, Union
+from typing import Set, Dict, Any, Optional, List, Union, TYPE_CHECKING
 
 from dlt.common.configuration import known_sections, resolve_configuration, with_config
 from dlt.common import logger, json
@@ -9,7 +9,7 @@ from dlt.common.destination.capabilities import (
     DestinationCapabilitiesContext,
     adjust_schema_to_capabilities,
 )
-from dlt.common.exceptions import MissingDependencyException
+from dlt.common.libs import is_pandas_frame, is_polars_frame
 from dlt.common.metrics import DataWriterMetrics
 from dlt.common.runtime.collector import Collector, NULL_COLLECTOR
 from dlt.common.typing import TDataItems, TDataItem, TLoaderFileFormat
@@ -22,6 +22,7 @@ from dlt.common.schema.typing import (
     TTableSchemaColumns,
     TPartialTableSchema,
 )
+from dlt.common.libs.sqlglot import filter_select_column_names
 from dlt.common.normalizers.json import helpers as normalize_helpers
 
 from dlt.extract.hints import HintsMeta, TResourceHints
@@ -30,17 +31,21 @@ from dlt.extract.items import DataItemWithMeta, TableNameMeta
 from dlt.extract.storage import ExtractorItemStorage
 from dlt.normalize.configuration import ItemsNormalizerConfiguration
 
-try:
-    from dlt.common.libs import pyarrow
-    from dlt.common.libs.pyarrow import pyarrow as pa, TAnyArrowItem, UnsupportedArrowTypeException
-except MissingDependencyException:
-    pyarrow = None
-    pa = None
+if TYPE_CHECKING:
+    from dlt.common.libs.pyarrow import pyarrow as pa, TAnyArrowItem
 
-try:
-    from dlt.common.libs.pandas import pandas, pandas_to_arrow
-except MissingDependencyException:
-    pandas = None
+
+def _to_arrow_table(item: Any) -> Any:
+    """Convert a pandas or polars frame to a pyarrow Table; pass arrow items through."""
+    if is_pandas_frame(item):
+        from dlt.common.libs.pandas import pandas_to_arrow
+
+        return pandas_to_arrow(item)
+    if is_polars_frame(item):
+        from dlt.common.libs.polars import polars_to_arrow
+
+        return polars_to_arrow(item)
+    return item
 
 
 class MaterializedEmptyList(List[Any]):
@@ -92,10 +97,13 @@ def with_file_import(
     metrics = DataWriterMetrics(file_path, items_count, 0, 0, 0)
     item: TDataItem = None
     # if hints are dict assume that this is dlt schema, if not - that it is arrow table
+    resource_hints: Optional[TResourceHints] = hints
     if not isinstance(hints, dict):
         item = hints
-        hints = None
-    return DataItemWithMeta(ImportFileMeta(file_path, metrics, file_format, hints, False), item)
+        resource_hints = None
+    return DataItemWithMeta(
+        ImportFileMeta(file_path, metrics, file_format, resource_hints, False), item
+    )
 
 
 class Extractor:
@@ -116,10 +124,10 @@ class Extractor:
         self.schema = schema
         self.naming = schema.naming
         self.collector = collector
-        self.resources_with_items: Set[str] = set()
-        """Tracks resources that received items"""
-        self.resources_with_empty: Set[str] = set()
-        """Track resources that received empty materialized list"""
+        self.tables_with_items: Set[str] = set()
+        """Tracks tables that received items"""
+        self.tables_with_empty: Set[str] = set()
+        """Tracks tables that received empty materialized list"""
         self.load_id = load_id
         self.item_storage = item_storage
         self._table_contracts: Dict[str, TSchemaContractDict] = {}
@@ -182,10 +190,10 @@ class Extractor:
         self.collector.update(table_name, inc=new_rows_count)
         # if there were rows or item was empty arrow table
         if new_rows_count > 0 or self.__class__ is ArrowExtractor:
-            self.resources_with_items.add(resource_name)
+            self.tables_with_items.add(table_name)
         else:
             if isinstance(items, MaterializedEmptyList):
-                self.resources_with_empty.add(resource_name)
+                self.tables_with_empty.add(table_name)
 
     def _import_item(
         self,
@@ -202,7 +210,7 @@ class Extractor:
             meta.file_format,
         )
         self.collector.update(table_name, inc=metrics.items_count)
-        self.resources_with_items.add(resource_name)
+        self.tables_with_items.add(table_name)
 
     def _write_to_dynamic_table(self, resource: DltResource, items: TDataItems, meta: Any) -> None:
         if not isinstance(items, list):
@@ -260,6 +268,14 @@ class Extractor:
         Computes new table and does contract checks, if false is returned, the table may not be created and no items should be written
         """
         computed_tables = self._compute_tables(resource, items, meta)
+        # pre-merge authoritative schema from validator into self.schema
+        # so authoritative columns bypass contract checks via diff
+        if resource.validator:
+            auth_schema = resource.validator.compute_table_schema(items, meta)
+            if auth_schema:
+                self.schema.update_table(
+                    auth_schema, normalize_identifiers=True, merge_compound_props=False
+                )
         for computed_table in computed_tables:
             table_name = computed_table["name"]
             # get or compute contract
@@ -271,23 +287,19 @@ class Extractor:
             # this is a new table so allow evolve once
             if schema_contract["columns"] != "evolve" and self.schema.is_new_table(table_name):
                 computed_table["x-normalizer"] = {"evolve-columns-once": True}
-            existing_table = self.schema.tables.get(table_name, None)
-            if existing_table:
-                # TODO: revise this. computed table should overwrite certain hints (ie. primary and merge keys) completely
-                diff_table = utils.diff_table(self.schema.name, existing_table, computed_table)
-            else:
-                diff_table = computed_table
 
             # apply contracts
-            diff_table, filters = self.schema.apply_schema_contract(
-                schema_contract, diff_table, data_item=items
+            computed_table, filters = self.schema.apply_schema_contract(
+                schema_contract, computed_table, data_item=items
             )
 
             # merge with schema table
-            if diff_table:
-                # diff table identifiers already normalized
+            if computed_table:
+                # computed table identifiers already normalized
                 self.schema.update_table(
-                    diff_table, normalize_identifiers=False, from_diff=bool(existing_table)
+                    computed_table,
+                    normalize_identifiers=False,
+                    merge_compound_props=False,
                 )
 
             # process filters
@@ -314,9 +326,35 @@ class ObjectExtractor(Extractor):
 
 
 class ModelExtractor(Extractor):
-    """Extracts text items and writes them row by row into a text file"""
+    """Extracts model items (SQL Relations) with data_type contract enforcement."""
 
-    pass
+    def _compute_and_update_tables(
+        self, resource: DltResource, root_table_name: str, items: TDataItems, meta: Any
+    ) -> TDataItems:
+        items = super()._compute_and_update_tables(resource, root_table_name, items, meta)
+        return self._apply_contract_filters(items, root_table_name)
+
+    def _apply_contract_filters(self, items: TDataItems, table_name: str) -> TDataItems:
+        """Apply data_type contract filters to model items (Relations)."""
+        filtered_columns = self._filtered_columns.get(table_name)
+        if not filtered_columns:
+            return items
+
+        if any(mode == "discard_row" for mode in filtered_columns.values()):
+            return items.limit(0)  # type: ignore[union-attr]
+
+        discard_value_cols = {
+            name for name, mode in filtered_columns.items() if mode == "discard_value"
+        }
+        if discard_value_cols:
+            selects = items.sqlglot_expression.selects  # type: ignore[union-attr]
+            remaining = filter_select_column_names(
+                selects, discard_value_cols, self.naming.normalize_identifier
+            )
+            if len(remaining) < len(selects):
+                items = items.select(*remaining)  # type: ignore[union-attr]
+
+        return items
 
 
 class ArrowExtractor(Extractor):
@@ -351,16 +389,8 @@ class ArrowExtractor(Extractor):
         static_table_name = self._get_static_table_name(resource, meta)
         items = [
             # 2. remove columns and rows in data contract filters
-            self._apply_contract_filters(tbl, resource, static_table_name)
-            for tbl in (
-                (
-                    # 1. Convert pandas frame(s) to arrow Table, remove indexes because we store
-                    pandas_to_arrow(item)
-                    if (pandas and isinstance(item, pandas.DataFrame))
-                    else item
-                )
-                for item in items_list
-            )
+            self._apply_contract_filters(_to_arrow_table(item), resource, static_table_name)
+            for item in items_list
         ]
         super().write_items(resource, items, meta)
 
@@ -375,6 +405,8 @@ class ArrowExtractor(Extractor):
         self, item: "TAnyArrowItem", resource: DltResource, static_table_name: Optional[str]
     ) -> "TAnyArrowItem":
         """Removes the columns (discard value) or rows (discard rows) as indicated by contract filters."""
+        from dlt.common.libs import pyarrow
+
         # convert arrow schema names into normalized names
         rename_mapping = pyarrow.get_normalized_arrow_fields_mapping(item.schema, self.naming)
         # find matching columns and delete by original name
@@ -413,6 +445,8 @@ class ArrowExtractor(Extractor):
         items: TDataItems,
         columns: TTableSchemaColumns = None,
     ) -> None:
+        from dlt.common.libs import pyarrow
+
         columns = columns or self.schema.get_table_columns(table_name)
         # Note: `items` is always a list here due to the conversion in `write_table`
         items = [
@@ -443,6 +477,8 @@ class ArrowExtractor(Extractor):
     def _compute_tables(
         self, resource: DltResource, items: TDataItems, meta: Any
     ) -> List[TPartialTableSchema]:
+        from dlt.common.libs import pyarrow
+
         arrow_tables: Dict[str, TTableSchema] = {}
 
         if isinstance(items, list):
@@ -454,7 +490,7 @@ class ArrowExtractor(Extractor):
         # arrow tables override the latter so the resultant schema is the same as if
         # they are sent separately
         for item in items:
-            computed_tables = super()._compute_tables(resource, item, Any)
+            computed_tables = super()._compute_tables(resource, item, meta)
             for computed_table in computed_tables:
                 arrow_table = arrow_tables.get(computed_table["name"])
                 # Merge the columns to include primary_key and other hints that may be set on the resource
@@ -469,6 +505,12 @@ class ArrowExtractor(Extractor):
                         pyarrow.py_arrow_to_table_schema_columns(item.schema),
                         self._caps,
                     )
+                    # drop incomplete columns inferred from pa.null() arrow fields
+                    arrow_table["columns"] = {
+                        k: v
+                        for k, v in arrow_table["columns"].items()
+                        if utils.is_complete_column(v)
+                    }
                 except pyarrow.UnsupportedArrowTypeException as e:
                     e.table_name = str(arrow_table.get("name"))
                     raise
@@ -510,9 +552,7 @@ class ArrowExtractor(Extractor):
                         " schema and data were unmodified. It is up to destination to coerce the"
                         " differences when loading. Change log level to INFO for more details."
                     )
-                utils.merge_columns(
-                    arrow_table["columns"], computed_table["columns"], merge_columns=True
-                )
+                utils.merge_columns(arrow_table["columns"], computed_table["columns"])
                 arrow_tables[computed_table["name"]] = arrow_table
 
         return list(arrow_tables.values())

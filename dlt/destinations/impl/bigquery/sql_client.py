@@ -1,5 +1,16 @@
 from contextlib import contextmanager
-from typing import Any, AnyStr, ClassVar, Iterator, List, Optional, Sequence, Generator
+from typing import (
+    Any,
+    AnyStr,
+    ClassVar,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Generator,
+    TYPE_CHECKING,
+    Union,
+)
 
 import google.cloud.bigquery as bigquery  # noqa: I250
 from google.api_core import exceptions as api_core_exceptions
@@ -9,7 +20,10 @@ from google.cloud.bigquery.dbapi import Connection as DbApiConnection, Cursor as
 from google.cloud.bigquery.dbapi import exceptions as dbapi_exceptions
 
 from dlt.common import logger
-from dlt.common.configuration.specs import GcpServiceAccountCredentialsWithoutDefaults
+from dlt.common.configuration.specs import (
+    GcpServiceAccountCredentialsWithoutDefaults,
+    GcpOAuthCredentials,
+)
 from dlt.common.destination import DestinationCapabilitiesContext
 from dlt.common.typing import StrAny
 from dlt.destinations.exceptions import (
@@ -23,8 +37,12 @@ from dlt.destinations.sql_client import (
     raise_database_error,
     raise_open_connection_error,
 )
-from dlt.destinations.typing import DBApi, DBTransaction, DataFrame, ArrowTable
+from dlt.destinations.typing import DBApi, DBTransaction
 from dlt.common.destination.dataset import DBApiCursor
+
+if TYPE_CHECKING:
+    from pandas import DataFrame
+    from pyarrow import Table as ArrowTable
 
 
 # terminal reasons as returned in BQ gRPC error response
@@ -49,10 +67,10 @@ class BigQueryDBApiCursorImpl(DBApiCursorImpl):
     def __init__(self, curr: DBApiCursor) -> None:
         super().__init__(curr)
 
-    def iter_df(self, chunk_size: int) -> Generator[DataFrame, None, None]:
+    def iter_df(self, chunk_size: int) -> Generator["DataFrame", None, None]:
         yield from self.native_cursor.query_job.result(page_size=chunk_size).to_dataframe_iterable()
 
-    def iter_arrow(self, chunk_size: int) -> Generator[ArrowTable, None, None]:
+    def iter_arrow(self, chunk_size: int) -> Generator["ArrowTable", None, None]:
         yield from self.native_cursor.query_job.result(page_size=chunk_size).to_arrow_iterable()
 
 
@@ -63,7 +81,7 @@ class BigQuerySqlClient(SqlClientBase[bigquery.Client], DBTransaction):
         self,
         dataset_name: str,
         staging_dataset_name: str,
-        credentials: GcpServiceAccountCredentialsWithoutDefaults,
+        credentials: Union[GcpServiceAccountCredentialsWithoutDefaults, GcpOAuthCredentials],
         capabilities: DestinationCapabilitiesContext,
         location: str = "US",
         project_id: Optional[str] = None,
@@ -71,7 +89,9 @@ class BigQuerySqlClient(SqlClientBase[bigquery.Client], DBTransaction):
         retry_deadline: float = 60.0,
     ) -> None:
         self._client: bigquery.Client = None
-        self.credentials: GcpServiceAccountCredentialsWithoutDefaults = credentials
+        self.credentials: Union[
+            GcpServiceAccountCredentialsWithoutDefaults, GcpOAuthCredentials
+        ] = credentials
         self.location = location
         self.project_id = project_id or self.credentials.project_id
         self.http_timeout = http_timeout

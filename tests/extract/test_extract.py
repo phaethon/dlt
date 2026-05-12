@@ -12,17 +12,17 @@ from dlt.common.storages import (
     NormalizeStorageConfiguration,
 )
 from dlt.common.storages.schema_storage import SchemaStorage
+from dlt.common.typing import TTableNames, TDataItems
 from dlt.common.utils import uniq_id
 
-from dlt.common.typing import TTableNames, TDataItems
 from dlt.extract import DltResource, DltSource
 from dlt.extract.exceptions import DataItemRequiredForDynamicTableHints, ResourceExtractionError
 from dlt.extract.extract import ExtractStorage, Extract
 from dlt.extract.hints import TResourceNestedHints, make_hints
-from dlt.extract.items_transform import ValidateItem
-
+from dlt.extract.items_transform import ValidateItem, MetricsItem
 from dlt.extract.items import TableNameMeta, DataItemWithMeta
-from tests.utils import MockPipeline, clean_test_storage, TEST_STORAGE_ROOT
+
+from tests.utils import MockPipeline, clean_test_storage, get_test_storage_root
 from tests.extract.utils import expect_extracted_file
 
 NESTED_DATA = [
@@ -42,7 +42,9 @@ NESTED_DATA = [
 def extract_step() -> Extract:
     clean_test_storage(init_normalize=True)
     schema_storage = SchemaStorage(
-        SchemaStorageConfiguration(schema_volume_path=os.path.join(TEST_STORAGE_ROOT, "schemas")),
+        SchemaStorageConfiguration(
+            schema_volume_path=os.path.join(get_test_storage_root(), "schemas")
+        ),
         makedirs=True,
     )
     return Extract(schema_storage, NormalizeStorageConfiguration())
@@ -613,6 +615,54 @@ def test_materialize_table_schema_with_pipe_items():
 
 
 @pytest.mark.parametrize(
+    "yield_one,yield_two",
+    [(True, False), (False, True), (False, False), (True, True)],
+    ids=["only_first", "only_second", "neither", "both"],
+)
+def test_materialize_table_schema_multi_table(yield_one: bool, yield_two: bool) -> None:
+    """Empty table materialization works correctly for resources that produce multiple tables."""
+
+    @dlt.resource
+    def multi_table():
+        yield dlt.mark.with_hints(
+            dlt.mark.materialize_table_schema(),
+            dlt.mark.make_hints(
+                table_name="table_one",
+                write_disposition="replace",
+                columns={"col_one": {"data_type": "text"}},
+            ),
+            create_table_variant=True,
+        )
+        yield dlt.mark.with_hints(
+            dlt.mark.materialize_table_schema(),
+            dlt.mark.make_hints(
+                table_name="table_two",
+                write_disposition="replace",
+                columns={"col_two": {"data_type": "bigint"}},
+            ),
+            create_table_variant=True,
+        )
+        if yield_one:
+            yield dlt.mark.with_table_name({"col_one": "val"}, table_name="table_one")
+        if yield_two:
+            yield dlt.mark.with_table_name({"col_two": 5}, table_name="table_two")
+
+    p = dlt.pipeline(
+        pipeline_name="materialize_multi_" + uniq_id(),
+        destination="duckdb",
+        dev_mode=True,
+    )
+    extract_info = p.extract(multi_table())
+
+    extracted_tables = {
+        job.job_file_info.table_name for job in extract_info.load_packages[0].jobs["new_jobs"]
+    }
+    # both tables should always have jobs — either with data or empty files
+    assert "table_one" in extracted_tables
+    assert "table_two" in extracted_tables
+
+
+@pytest.mark.parametrize(
     "with_custom_metrics", [True, False], ids=["with_custom_metrics", "without_custom_metrics"]
 )
 def test_resource_custom_metrics(extract_step: Extract, with_custom_metrics: bool) -> None:
@@ -625,6 +675,7 @@ def test_resource_custom_metrics(extract_step: Extract, with_custom_metrics: boo
                 "random_constant": 1.5,
                 "random_nested": {"value": 100, "unit": "items"},
                 "items_count": 90,
+                "events": [{"ts": 1}, {"ts": 2}],
             },
             "resource_with_other_metrics": {
                 "custom_count": 3,
@@ -681,6 +732,58 @@ def test_resource_custom_metrics(extract_step: Extract, with_custom_metrics: boo
         expected_custom_metrics["resource_with_other_metrics"]
         == all_resource_metrics["resource_with_other_metrics"].custom_metrics
     )
+
+    # verify _asdict() promotes list-valued metrics to top-level keys
+    if with_custom_metrics:
+        d = all_resource_metrics["resource_with_metrics"]._asdict()
+        assert d["events"] == [{"ts": 1}, {"ts": 2}]
+        assert "events" not in d.get("custom_metrics", {})
+        assert d["custom_metrics"]["custom_count"] == 42
+
+
+def test_asdict_all_list_metrics(extract_step: Extract) -> None:
+    """When all custom metrics are list-valued, no custom_metrics key appears in _asdict()."""
+
+    @dlt.resource
+    def only_lists():
+        m = dlt.current.resource_metrics()
+        m["rows"] = [{"a": 1}]
+        m["errors"] = [{"msg": "oops"}]
+        yield [{"id": 1}]
+
+    source = DltSource(dlt.Schema("all_list"), "module", [only_lists()])
+    load_id = extract_step.extract(source, 20, 1)
+    step_info = extract_step.get_step_info(MockPipeline("buba", first_run=False))  # type: ignore[abstract]
+    d = step_info.metrics[load_id][0]["resource_metrics"]["only_lists"]._asdict()
+    assert "custom_metrics" not in d
+    assert d["rows"] == [{"a": 1}]
+    assert d["errors"] == [{"msg": "oops"}]
+
+
+def test_asdict_list_metric_collision_with_standard_field(extract_step: Extract) -> None:
+    """List-valued custom metric whose key collides with a standard NamedTuple field
+    stays nested under custom_metrics so it cannot overwrite standard metrics."""
+
+    @dlt.resource
+    def collision():
+        m = dlt.current.resource_metrics()
+        # items_count is a standard DataWriterMetrics field
+        m["items_count"] = [{"v": 99}]
+        m["safe_list"] = [{"v": 1}]
+        yield [{"id": 1}]
+
+    source = DltSource(dlt.Schema("collision"), "module", [collision()])
+    load_id = extract_step.extract(source, 20, 1)
+    step_info = extract_step.get_step_info(MockPipeline("buba", first_run=False))  # type: ignore[abstract]
+    metrics = step_info.metrics[load_id][0]["resource_metrics"]["collision"]
+    d = metrics._asdict()
+    # standard field preserved
+    assert isinstance(d["items_count"], int)
+    # colliding list metric stays in custom_metrics
+    assert d["custom_metrics"]["items_count"] == [{"v": 99}]
+    # non-colliding list metric promoted
+    assert d["safe_list"] == [{"v": 1}]
+    assert "safe_list" not in d.get("custom_metrics", {})
 
 
 @pytest.mark.parametrize(
@@ -784,6 +887,8 @@ def test_add_metrics(extract_step: Extract, as_single_batch: bool) -> None:
             priority = meta["priority"]
             key = f"{priority}_priority_count"
             metrics[key] = metrics.get(key, 0) + 1
+            # collect list-valued metric for child table promotion
+            metrics.setdefault("seen_priorities", []).append({"priority": priority})
 
     data_with_priority.add_metrics(count_by_priority)
 
@@ -803,6 +908,13 @@ def test_add_metrics(extract_step: Extract, as_single_batch: bool) -> None:
     assert source.resources["data_with_priority"].custom_metrics == {
         "high_priority_count": 2,
         "low_priority_count": 3,
+        "seen_priorities": [
+            {"priority": "high"},
+            {"priority": "high"},
+            {"priority": "low"},
+            {"priority": "low"},
+            {"priority": "low"},
+        ],
     }
 
     step_info = extract_step.get_step_info(MockPipeline("buba", first_run=False))  # type: ignore[abstract]
@@ -821,4 +933,136 @@ def test_add_metrics(extract_step: Extract, as_single_batch: bool) -> None:
     assert all_resource_metrics["data_with_priority"].custom_metrics == {
         "high_priority_count": 2,
         "low_priority_count": 3,
+        "seen_priorities": [
+            {"priority": "high"},
+            {"priority": "high"},
+            {"priority": "low"},
+            {"priority": "low"},
+            {"priority": "low"},
+        ],
     }
+
+    # verify _asdict() promotes list-valued metrics to top-level keys
+    d = all_resource_metrics["data_with_priority"]._asdict()
+    assert d["seen_priorities"] == [
+        {"priority": "high"},
+        {"priority": "high"},
+        {"priority": "low"},
+        {"priority": "low"},
+        {"priority": "low"},
+    ]
+    assert "seen_priorities" not in d.get("custom_metrics", {})
+    assert d["custom_metrics"]["high_priority_count"] == 2
+
+
+def test_custom_metrics_preserved_when_all_items_filtered(extract_step: Extract) -> None:
+    """Zero-yield resources still surface their custom metrics in extract_info."""
+
+    @dlt.resource
+    def all_filtered():
+        # API 1: `dlt.current.resource_metrics()` mutated from inside the resource
+        dlt.current.resource_metrics()["seen_via_current"] = True
+        yield [1, 2, 3]
+
+    def early_counter(items: TDataItems, meta: Any, metrics: Dict[str, Any]) -> None:
+        # runs BEFORE the filter — fires once on the single input batch
+        metrics["early_count"] = metrics.get("early_count", 0) + 1
+
+    # API 2: add_metrics runs before the filter; filter then drops every item so
+    # no file is ever written for this resource
+    all_filtered.add_metrics(early_counter).add_filter(lambda _: False)
+
+    source = DltSource(dlt.Schema("metrics"), "module", [all_filtered])
+    load_id = extract_step.extract(source, 20, 1)
+
+    # the MetricsItem step held its own counter from the pre-filter callback
+    resource = source.resources["all_filtered"]
+    metrics_steps = [s for s in resource._pipe.steps if isinstance(s, MetricsItem)]
+    assert len(metrics_steps) == 1
+    assert metrics_steps[0].custom_metrics == {"early_count": 1}
+
+    # persisted metrics: resource is present with zero items_count and merged customs
+    step_info = extract_step.get_step_info(MockPipeline("buba", first_run=False))  # type: ignore[abstract]
+    all_resource_metrics = step_info.metrics[load_id][0]["resource_metrics"]
+    assert "all_filtered" in all_resource_metrics
+    rm = all_resource_metrics["all_filtered"]
+    assert rm.items_count == 0
+    assert rm.custom_metrics == {"early_count": 1, "seen_via_current": True}
+
+
+def test_object_mixed_case_columns_normalized(extract_step: Extract) -> None:
+    """Column hints with PascalCase names are normalized to snake_case in the schema.
+
+    Also verifies that a nullable hint-only column (not present in the data) is persisted
+    with its normalized name and properties.
+    """
+
+    @dlt.resource(
+        name="mixed_case",
+        columns={
+            "Numbers": {"data_type": "bigint"},
+            "Strings": {"data_type": "text"},
+            # hint-only column not present in yielded data
+            "ExtraCol": {"data_type": "double", "nullable": True},
+        },
+    )
+    def mixed_case_resource():
+        yield {"Numbers": 1, "Strings": "a"}
+
+    source = DltSource(dlt.Schema("object_test"), "module", [mixed_case_resource])
+    extract_step.extract(source, 20, 1)
+
+    schema_table = source.schema.tables["mixed_case"]
+    col_names = list(schema_table["columns"].keys())
+    # only normalized (snake_case) names
+    assert "numbers" in col_names
+    assert "strings" in col_names
+    assert "Numbers" not in col_names
+    assert "Strings" not in col_names
+    assert "ExtraCol" not in col_names
+    # hint properties preserved through normalization
+    assert schema_table["columns"]["numbers"]["data_type"] == "bigint"
+    assert schema_table["columns"]["strings"]["data_type"] == "text"
+    # hint-only column persisted with normalized name
+    assert "extra_col" in col_names
+    assert schema_table["columns"]["extra_col"]["data_type"] == "double"
+    assert schema_table["columns"]["extra_col"]["nullable"] is True
+
+
+def test_object_special_char_columns_normalized(extract_step: Extract) -> None:
+    """Column hints with special characters (e.g. ^) are normalized in the schema."""
+
+    @dlt.resource(
+        name="special_chars",
+        columns={"col^New": {"data_type": "bigint"}, "col2": {"data_type": "bigint"}},
+    )
+    def special_chars_resource():
+        yield {"col^New": 1, "col2": 2}
+
+    source = DltSource(dlt.Schema("object_test"), "module", [special_chars_resource])
+    extract_step.extract(source, 20, 1)
+
+    schema_table = source.schema.tables["special_chars"]
+    col_names = list(schema_table["columns"].keys())
+    # col^New normalized to col_new
+    assert "col_new" in col_names
+    assert "col2" in col_names
+    assert "col^New" not in col_names
+
+
+def test_object_dynamic_table_mixed_case_normalized(extract_step: Extract) -> None:
+    """Dynamic table names with mixed case are normalized in the schema."""
+
+    @dlt.resource(name="dynamic_res")
+    def dynamic_resource():
+        yield dlt.mark.with_table_name({"id": 1}, "MyTable")
+        yield dlt.mark.with_table_name({"id": 2}, "AnotherTable")
+
+    source = DltSource(dlt.Schema("object_test"), "module", [dynamic_resource])
+    extract_step.extract(source, 20, 1)
+
+    table_names = list(source.schema.tables.keys())
+    assert "my_table" in table_names
+    assert "another_table" in table_names
+    assert "MyTable" not in table_names
+    assert "AnotherTable" not in table_names

@@ -1,5 +1,6 @@
 import os
-from typing import Any, ClassVar, Dict, List, Optional, Protocol
+import warnings
+from typing import Any, ClassVar, Dict, List, Optional, Protocol, Sequence, Set
 import pluggy
 import argparse
 import importlib.metadata
@@ -40,36 +41,37 @@ def manager() -> pluggy.PluginManager:
 
 
 def load_setuptools_entrypoints(m: pluggy.PluginManager) -> List[str]:
-    """Scans setuptools distributions that are path or have name starting with `dlt`
-    loads entry points in group `dlt` and instantiates them to initialize plugins.
+    """Loads entry points in group `dlt` and instantiates them to initialize plugins.
 
-    returns a list of names of top level modules/packages from detected entry points.
+    Returns a list of names of top level modules/packages from detected entry points.
     """
 
-    plugin_modules = []
+    plugin_modules: List[str] = []
 
     if os.environ.get(DLT_DISABLE_PLUGINS, "False").lower() == "false":
-        distributions = list(importlib.metadata.distributions())
+        distributions = importlib.metadata.distributions()
     else:
         # always plug itself
-        distributions = [importlib.metadata.distribution("dlt")]
+        distributions = iter([importlib.metadata.distribution("dlt")])
 
     for dist in distributions:
-        # skip named dists that do not start with dlt-
-        package_name = dist.metadata.get("Name")
-
-        if not package_name or not package_name.startswith("dlt"):
-            continue
-
+        # filter by group on entry_points which is cheaper than looking into dist metadata
         for ep in dist.entry_points:
-            if (
-                ep.group != "dlt"
-                # already registered
-                or m.get_plugin(ep.name)
-                or m.is_blocked(ep.name)
-            ):
+            if ep.group != "dlt":
                 continue
-            plugin = ep.load()
+            if m.get_plugin(ep.name) or m.is_blocked(ep.name):
+                continue
+            try:
+                plugin = ep.load()
+            except Exception as e:
+                # only resolve dist name on failure to keep the happy path fast
+                # (`Distribution.name` is 3.10+; fall back to `metadata['Name']` on 3.9)
+                package_name = getattr(dist, "name", None) or dist.metadata["Name"] or "?"
+                warnings.warn(
+                    f"Plugin {ep.name} from {package_name} failed to load: {e}",
+                    stacklevel=1,
+                )
+                continue
             m.register(plugin, name=ep.name)
             m._plugin_distinfo.append((plugin, pluggy._manager.DistFacade(dist)))
             top_module = ep.module.split(".")[0]
@@ -118,3 +120,30 @@ class SupportsCliCommand(Protocol):
 @hookspec()
 def plug_cli() -> SupportsCliCommand:
     """Spec for plugin hook that returns current run context."""
+
+
+class SupportsMcpFeatures(Protocol):
+    """Protocol for contributing MCP tools, prompts, and providers via plug_mcp hook"""
+
+    name: str
+    """unique name identifying this feature set"""
+    tools: Sequence[Any]
+    """tool functions or Tool objects to register"""
+    prompts: Sequence[Any]
+    """prompt functions or Prompt objects to register"""
+    providers: Sequence[Any]
+    """provider instances (e.g. SkillProvider) to register"""
+
+
+@hookspec()
+def plug_mcp(features: Set[str]) -> Optional[SupportsMcpFeatures]:
+    """Spec for plugin hook that contributes MCP tools, prompts, and providers.
+
+    MCP server will broadcast `features` to all registered plugins that may
+    decide to return a MCP feature (combination of tools, skills and prompts)
+    or not. The server collects all non-None results and registers everything on the
+    FastMCP instance.
+
+    Args:
+        features: set of feature keywords the server requests
+    """

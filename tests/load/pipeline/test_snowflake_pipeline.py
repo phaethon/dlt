@@ -1,11 +1,14 @@
+import decimal
 from copy import deepcopy
 import os
 import pytest
-from typing import cast
+from typing import Any, cast
 from pytest_mock import MockerFixture
 
 import dlt
 from dlt.common import pendulum
+from dlt.common.configuration.specs.aws_credentials import AwsCredentials
+from dlt.common.destination import TLoaderFileFormat
 from dlt.common.utils import uniq_id
 from dlt.destinations.exceptions import DatabaseUndefinedRelation
 from dlt.load.exceptions import LoadClientJobFailed
@@ -18,6 +21,7 @@ from tests.load.utils import (
     assert_all_data_types_row,
     destinations_configs,
     DestinationTestConfiguration,
+    AWS_BUCKET,
 )
 from tests.cases import TABLE_ROW_ALL_DATA_TYPES_DATETIMES, table_update_and_row
 
@@ -87,11 +91,94 @@ def test_snowflake_query_tagging(
     from dlt.destinations.impl.snowflake.sql_client import SnowflakeSqlClient
 
     os.environ["DESTINATION__SNOWFLAKE__QUERY_TAG"] = QUERY_TAG
-    tag_query_spy = mocker.spy(SnowflakeSqlClient, "_tag_session")
-    pipeline = destination_config.setup_pipeline("test_snowflake_case_sensitive_identifiers")
+    set_query_tags_spy = mocker.spy(SnowflakeSqlClient, "set_query_tags")
+    pipeline = destination_config.setup_pipeline("test_snowflake_query_tagging")
     info = pipeline.run([1, 2, 3], table_name="digits", **destination_config.run_kwargs)
     assert_load_info(info)
-    assert tag_query_spy.call_count == 2
+
+    expected_load_id = info.loads_ids[0]
+    expected_pipeline_name = pipeline.pipeline_name
+    expected_source = pipeline.default_schema.name
+    expected_resource = pipeline.default_schema.get_table("digits")["resource"]
+
+    tag_calls = [call.args[1] for call in set_query_tags_spy.call_args_list]
+    load_tags = [
+        call for call in tag_calls if call["operation"] == "load" and call["table"] == "digits"
+    ]
+    assert load_tags
+    assert load_tags[0] == {
+        "operation": "load",
+        "source": expected_source,
+        "resource": expected_resource,
+        "table": "digits",
+        "load_id": expected_load_id,
+        "pipeline_name": expected_pipeline_name,
+    }
+
+    complete_load_tags = [call for call in tag_calls if call["operation"] == "complete_load"]
+    assert complete_load_tags
+    assert complete_load_tags[0] == {
+        "operation": "complete_load",
+        "source": expected_source,
+        "resource": "",
+        "table": "",
+        "load_id": expected_load_id,
+        "pipeline_name": expected_pipeline_name,
+    }
+
+    operations = {call["operation"] for call in tag_calls}
+    assert operations == {
+        "complete_load",
+        "get_stored_state",
+        "load",
+        "prepare_storage",
+        "update_stored_schema",
+    }
+
+    set_query_tags_spy.reset_mock()
+    pipeline._schema_storage.clear_storage()
+    pipeline.sync_destination()
+
+    sync_tag_calls = [call.args[1] for call in set_query_tags_spy.call_args_list]
+    operations = {call["operation"] for call in sync_tag_calls}
+    assert operations == {"get_stored_state", "get_stored_schema"}
+    for operation in ("get_stored_state", "get_stored_schema"):
+        operation_tags = [call for call in sync_tag_calls if call["operation"] == operation]
+        assert operation_tags
+        assert operation_tags[0] == {
+            "operation": operation,
+            "source": expected_source,
+            "resource": "",
+            "table": "",
+            "load_id": "",
+            "pipeline_name": expected_pipeline_name,
+        }
+
+    set_query_tags_spy.reset_mock()
+    info = pipeline.run(
+        [1, 2, 3], table_name="digits", refresh="drop_sources", **destination_config.run_kwargs
+    )
+    assert_load_info(info)
+    refresh_load_id = info.loads_ids[0]
+    refresh_tag_calls = [call.args[1] for call in set_query_tags_spy.call_args_list]
+    operations = {call["operation"] for call in refresh_tag_calls}
+    assert operations == {
+        "complete_load",
+        "drop_tables",
+        "load",
+        "prepare_storage",
+        "update_stored_schema",
+    }
+    drop_table_tags = [call for call in refresh_tag_calls if call["operation"] == "drop_tables"]
+    assert drop_table_tags
+    assert drop_table_tags[0] == {
+        "operation": "drop_tables",
+        "source": expected_source,
+        "resource": "",
+        "table": "",
+        "load_id": refresh_load_id,
+        "pipeline_name": expected_pipeline_name,
+    }
 
 
 # do not remove - it allows us to filter tests by destination
@@ -505,3 +592,282 @@ def test_snowflake_merge_time(destination_config):
     merge_time = time.time() - start_time
     print(f"Merge operation completed in {merge_time:.2f} seconds")
     assert_load_info(merge_info)
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["snowflake"]),
+    ids=lambda x: x.name,
+)
+@pytest.mark.parametrize("loader_file_format", ["jsonl", "csv", "parquet"])
+def test_snowflake_decfloat_loading_and_schema(
+    destination_config: DestinationTestConfiguration,
+    loader_file_format: TLoaderFileFormat,
+) -> None:
+    """Load decimal data using DECFLOAT type and verify across file formats.
+
+    Text-based formats (jsonl, csv) work correctly: INFORMATION_SCHEMA shows DECFLOAT
+    and values round-trip through dataset().fetchall().
+
+    Parquet does NOT work: parquet maps unbound decimals to DECIMAL(38,9) which has only
+    29 integer digits. Values requiring DECFLOAT's full 36-digit range fail at normalize
+    because they overflow the fixed parquet precision.
+    """
+    snow_ = dlt.destinations.snowflake(use_decfloat=True)
+    pipeline = destination_config.setup_pipeline(
+        "test_decfloat_loading",
+        dataset_name="decfloat_test_" + uniq_id(),
+        destination=snow_,
+    )
+
+    # Use values that exceed 128-bit integer range (2^127-1 ≈ 1.7e38) when unscaled.
+    # "1e35" has 36 digits total and its significand exceeds 128-bit capacity, proving
+    # DECFLOAT handles what a fixed-precision 128-bit decimal cannot.
+    val_large = decimal.Decimal("123456789012345678901234567890123456")  # 36 integer digits
+    val_small = decimal.Decimal("0.123456789012345678901234567890123456")  # 36 fractional digits
+
+    @dlt.resource(
+        table_name="decfloat_data",
+        columns=[{"name": "amount", "data_type": "decimal"}],
+    )
+    def decimal_data():
+        yield [
+            {"amount": val_small},
+            {"amount": val_large},
+        ]
+
+    if loader_file_format == "parquet":
+        # Parquet uses fixed-precision DECIMAL(38,9) → 29 integer digits max.
+        # Values exceeding 128-bit range can't be represented in parquet at all, so
+        # the pipeline fails at normalize. Use jsonl or csv for DECFLOAT's full range.
+        with pytest.raises(PipelineStepFailed):
+            pipeline.run(decimal_data(), loader_file_format=loader_file_format)
+        return
+
+    info = pipeline.run(decimal_data(), loader_file_format=loader_file_format)
+    assert_load_info(info)
+
+    # verify the column type in Snowflake's INFORMATION_SCHEMA is DECFLOAT
+    with pipeline.sql_client() as client:
+        _, schema_name, table_names = client._get_information_schema_components("decfloat_data")
+        rows = client.execute_sql(
+            "SELECT data_type FROM INFORMATION_SCHEMA.COLUMNS"
+            f" WHERE table_schema = '{schema_name}'"
+            f" AND table_name = '{table_names[0]}'"
+            " AND column_name = 'AMOUNT'"
+        )
+        assert rows[0][0] == "DECFLOAT"
+
+    # verify data via dataset() fetchall with increased precision context
+    with decimal.localcontext(decimal.Context(prec=38)):
+        rows = pipeline.dataset().decfloat_data.select("amount").order_by("amount").fetchall()
+    assert len(rows) == 2
+    assert rows[0][0] == val_small
+    assert rows[1][0] == val_large
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["snowflake"]),
+    ids=lambda x: x.name,
+)
+def test_snowflake_decfloat_arrow_reading_not_supported(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """The arrow/df path does not correctly handle DECFLOAT columns.
+    The Snowflake connector logs 'unknown snowflake data type : DECFLOAT' and returns
+    a raw dict instead of Decimal. The DB-API path (fetchall()) works correctly."""
+    snow_ = dlt.destinations.snowflake(use_decfloat=True)
+    pipeline = destination_config.setup_pipeline(
+        "test_decfloat_arrow",
+        dataset_name="decfloat_arrow_" + uniq_id(),
+        destination=snow_,
+    )
+
+    @dlt.resource(
+        table_name="decfloat_arrow",
+        columns=[
+            {"name": "amount", "data_type": "decimal"},
+            {"name": "label", "data_type": "text"},
+        ],
+    )
+    def decimal_data():
+        yield [{"amount": decimal.Decimal("42.5"), "label": "test"}]
+
+    info = pipeline.run(decimal_data(), loader_file_format="jsonl")
+    assert_load_info(info)
+
+    # DB-API path via dataset() works correctly
+    rows = pipeline.dataset().decfloat_arrow.select("amount").fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == decimal.Decimal("42.5")
+
+    # arrow path: Snowflake connector doesn't recognize DECFLOAT and returns a raw
+    # structured dict {'exponent': ..., 'significand': ...} instead of a proper Decimal.
+    # Using .arrow() directly to surface the underlying issue without pandas wrapping.
+    table = pipeline.dataset().decfloat_arrow.arrow()
+    assert table is not None
+    val = table.column("amount").to_pylist()[0]
+    assert not isinstance(
+        val, decimal.Decimal
+    ), f"Expected raw dict from arrow path, got Decimal: {val}"
+    assert isinstance(val, dict)
+    assert "exponent" in val and "significand" in val
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["snowflake"]),
+    ids=lambda x: x.name,
+)
+def test_snowflake_decfloat_precision_preservation(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """DECFLOAT stores up to 36 significant digits. Standard DECIMAL(38,9) has only 29 integer
+    digits and 9 fractional, so it can't store a number with 36 significant digits without
+    truncation. This test loads such numbers and verifies exact round-trip.
+
+    Python's default decimal context has prec=28, but DECFLOAT supports 36 digits.
+    We must increase Python's precision context BEFORE fetching so the Snowflake connector
+    creates Decimal objects with full precision.
+    """
+    snow_ = dlt.destinations.snowflake(use_decfloat=True)
+    pipeline = destination_config.setup_pipeline(
+        "test_decfloat_precision",
+        dataset_name="decfloat_prec_" + uniq_id(),
+        destination=snow_,
+    )
+
+    # 36-digit significant figures: can't fit in DECIMAL(38,9) without precision loss
+    # large number: 30 integer digits + 6 fractional = 36 significant digits
+    large_val = decimal.Decimal("123456789012345678901234567890.123456")
+    # small number: 36 fractional significant digits
+    small_val = decimal.Decimal("0.123456789012345678901234567890123456")
+
+    @dlt.resource(
+        table_name="decfloat_precision",
+        columns=[{"name": "val", "data_type": "decimal"}],
+    )
+    def precision_data():
+        yield [
+            {"val": large_val},
+            {"val": small_val},
+        ]
+
+    info = pipeline.run(precision_data(), loader_file_format="jsonl")
+    assert_load_info(info)
+
+    # The Snowflake connector creates Decimal objects using the current thread-local decimal
+    # context, so we MUST set extended precision BEFORE the fetch call.
+    with decimal.localcontext() as ctx:
+        ctx.prec = 38  # enough for DECFLOAT's 36 significant digits
+
+        rows = pipeline.dataset().decfloat_precision.select("val").order_by("val").fetchall()
+        assert len(rows) == 2
+
+        retrieved_small = rows[0][0]
+        retrieved_large = rows[1][0]
+
+        # verify exact round-trip: the values should survive with full precision
+        assert (
+            retrieved_small == small_val
+        ), f"Small value precision loss: {retrieved_small} != {small_val}"
+        assert (
+            retrieved_large == large_val
+        ), f"Large value precision loss: {retrieved_large} != {large_val}"
+
+        # verify addition with extended precision works correctly
+        total = retrieved_small + retrieved_large
+        expected_total = small_val + large_val
+        assert total == expected_total
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, subset=["snowflake"]),
+    ids=lambda x: x.name,
+)
+def test_snowflake_decfloat_python_default_precision_warning(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """Demonstrate that Python's default decimal precision (28) is insufficient for DECFLOAT's
+    36-digit range. The Snowflake connector creates Decimal objects using the current context
+    during fetch, so fetching with prec=28 already truncates the value."""
+    snow_ = dlt.destinations.snowflake(use_decfloat=True)
+    pipeline = destination_config.setup_pipeline(
+        "test_decfloat_default_prec",
+        dataset_name="decfloat_defprec_" + uniq_id(),
+        destination=snow_,
+    )
+
+    # 36 significant digits: exceeds Python's default prec=28
+    val_36_digits = decimal.Decimal("123456789012345678901234567890.123456")
+
+    @dlt.resource(
+        table_name="decfloat_defprec",
+        columns=[{"name": "val", "data_type": "decimal"}],
+    )
+    def precision_data():
+        yield [{"val": val_36_digits}]
+
+    info = pipeline.run(precision_data(), loader_file_format="jsonl")
+    assert_load_info(info)
+
+    # fetch with default Python precision (28): the connector truncates during fetch
+    rows = pipeline.dataset().decfloat_defprec.select("val").fetchall()
+    retrieved_default = rows[0][0]
+    # 36-digit number is already truncated to 28 significant digits at fetch time
+    assert retrieved_default != val_36_digits
+
+    # fetch with extended precision: the connector preserves all 36 digits
+    with decimal.localcontext() as ctx:
+        ctx.prec = 38
+        rows = pipeline.dataset().decfloat_defprec.select("val").fetchall()
+        retrieved_extended = rows[0][0]
+        assert retrieved_extended == val_36_digits
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(
+        all_staging_configs=True, subset=["snowflake"], with_file_format="parquet"
+    ),
+    ids=lambda x: x.name,
+)
+def test_snowflake_staging_with_default_chain_credentials(
+    destination_config: DestinationTestConfiguration,
+    mocker: Any,
+) -> None:
+    """Snowflake loads data via S3 staging using frozen credentials from botocore default chain."""
+    fs_creds = dlt.secrets.get("destination.filesystem.credentials", AwsCredentials)
+    if not fs_creds or not hasattr(fs_creds, "aws_access_key_id"):
+        pytest.skip("S3 filesystem credentials not configured")
+
+    sts_creds = fs_creds.to_sts_credentials()
+    fs_creds.aws_access_key_id = sts_creds["aws_access_key_id"]
+    fs_creds.aws_secret_access_key = sts_creds["aws_secret_access_key"]
+    fs_creds.aws_session_token = sts_creds["aws_session_token"]
+    boto_session = fs_creds._to_botocore_session()
+    assert boto_session.get_credentials().token == fs_creds.aws_session_token
+
+    spy = mocker.spy(AwsCredentials, "to_session_credentials")
+
+    staging_destination = dlt.destinations.filesystem(AWS_BUCKET, credentials=boto_session)
+    pipeline = destination_config.setup_pipeline(
+        "snowflake_staging_" + uniq_id(), dev_mode=True, staging=staging_destination
+    )
+    pipeline.run(
+        [{"id": i, "value": f"row_{i}"} for i in range(5)],
+        table_name="default_chain_test",
+        loader_file_format="parquet",
+    )
+
+    with pipeline.sql_client() as c:
+        rows = c.execute_sql("SELECT count(*) FROM default_chain_test")
+        assert rows[0][0] == 5
+
+    # verify to_session_credentials was called and returned frozen STS credentials with token
+    assert spy.call_count > 0
+    for call in spy.spy_return_list:
+        assert call["aws_session_token"] is not None
+        assert call["aws_session_token"] == fs_creds.aws_session_token

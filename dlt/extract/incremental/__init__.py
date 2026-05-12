@@ -1,9 +1,8 @@
-import os
-from datetime import datetime  # noqa: I251
 from typing import (
     Generic,
     ClassVar,
     Any,
+    List,
     Optional,
     Type,
     Dict,
@@ -11,13 +10,14 @@ from typing import (
     Literal,
     Tuple,
 )
-
+from datetime import datetime  # noqa: I251
 import inspect
 from functools import wraps
 
 from dlt.common import logger
-from dlt.common.exceptions import MissingDependencyException, ValueErrorWithKnownValues
-from dlt.common.pendulum import pendulum
+from dlt.common.data_types.typing import TDataType
+from dlt.common.exceptions import ValueErrorWithKnownValues
+from dlt.common.libs import is_arrow_object, is_pandas_frame, is_polars_frame
 from dlt.common.jsonpath import compile_path, extract_simple_field_name
 from dlt.common.typing import (
     TDataItem,
@@ -37,15 +37,9 @@ from dlt.common.configuration import configspec, ConfigurationValueError
 from dlt.common.configuration.specs import BaseConfiguration
 from dlt.common.data_types.type_helpers import (
     coerce_from_date_types,
-    coerce_value,
     py_type_to_sc_type,
 )
 from dlt.common.data_writers.writers import count_rows_in_items
-from dlt.extract.exceptions import IncrementalUnboundError
-from dlt.extract.incremental.exceptions import (
-    IncrementalCursorPathMissing,
-    IncrementalPrimaryKeyMissing,
-)
 from dlt.common.incremental.typing import (
     IncrementalColumnState,
     TCursorValue,
@@ -54,32 +48,35 @@ from dlt.common.incremental.typing import (
     IncrementalArgs,
     TIncrementalRange,
 )
+
+from dlt.extract.exceptions import IncrementalUnboundError
+from dlt.extract.incremental.exceptions import (
+    ExternalSchedulerNotAvailable,
+    IncrementalCursorPathMissing,
+    IncrementalPrimaryKeyMissing,
+    JoinSchedulerError,
+)
+from dlt.extract.incremental.context import TimeIntervalContext, get_interval_context
 from dlt.extract.items import SupportsPipe, TTableHintTemplate
-from dlt.extract.items_transform import BaseItemTransform, ItemTransform
+from dlt.extract.items_transform import ItemTransform
 from dlt.extract.state import resource_state
 from dlt.extract.incremental.transform import (
     JsonIncremental,
     ArrowIncremental,
     IncrementalTransform,
 )
-from dlt.extract.incremental.lag import apply_lag
-
-try:
-    from dlt.common.libs.pyarrow import is_arrow_item
-except MissingDependencyException:
-    is_arrow_item = lambda item: False
-
-try:
-    from dlt.common.libs.pandas import pandas
-except MissingDependencyException:
-    pandas = None
+from dlt.extract.incremental.lag import apply_lag_with_suppression
 
 
-class IncrementalCustomMetrics(TypedDict, total=False):
+class IncrementalMetricsRow(TypedDict, total=False):
     unfiltered_items_count: int
     unfiltered_batches_count: int
     initial_unique_hashes_count: int
     final_unique_hashes_count: int
+
+
+class IncrementalCustomMetrics(TypedDict, total=False):
+    incremental: List[IncrementalMetricsRow]
 
 
 @configspec
@@ -198,6 +195,8 @@ class Incremental(
 
         self._cached_state: IncrementalColumnState = None
         """State dictionary cached on first access"""
+        self._cached_state_start_value: TCursorValue = None
+        """Start value to be written to cached state if data arrives"""
 
         self.lag = lag
         super().__init__(lambda x: x)  # TODO:
@@ -212,12 +211,17 @@ class Incremental(
         """Bound pipe"""
         self.range_start = range_start
         self.range_end = range_end
-        self._custom_metrics: IncrementalCustomMetrics = {
+        self._incremental_metrics: IncrementalMetricsRow = {
             "unfiltered_items_count": 0,
             "unfiltered_batches_count": 0,
             "initial_unique_hashes_count": 0,
             "final_unique_hashes_count": 0,
         }
+        self._custom_metrics: IncrementalCustomMetrics = {
+            "incremental": [self._incremental_metrics],
+        }
+        self._dedup_key_from_hints: Optional[bool] = False if primary_key is not None else None
+        """Tells if dedup key was set from resource hints, to prevent overrides of directly set values"""
 
     @property
     def primary_key(self) -> Optional[TTableHintTemplate[TColumnNames]]:
@@ -225,8 +229,21 @@ class Incremental(
 
     @primary_key.setter
     def primary_key(self, value: str) -> None:
+        # set deduplication key directly
+        self.set_deduplication_key(value, from_hints=False)
+
+    def set_deduplication_key(
+        self, value: Optional[TTableHintTemplate[TColumnNames]], from_hints: bool
+    ) -> None:
+        """Set deduplication key. Manage priority with `from_hints` flag so values coming
+        from hints never overwrite values set directly"""
+        # do not allow to set primary key is it is being set from resource hints
+        # but was already set directly on incremental
+        if from_hints and self._dedup_key_from_hints is False:
+            return
         # set key in incremental and data type transformers
         self._primary_key = value
+        self._dedup_key_from_hints = from_hints
         if self._transformers:
             for transform in self._transformers.values():
                 transform.primary_key = value
@@ -253,12 +270,15 @@ class Incremental(
         """
         # func, resource name and primary key are not part of the dict
         kwargs = dict(
-            self, last_value_func=self.last_value_func, primary_key=self._primary_key, lag=self.lag
+            self,
+            last_value_func=self.last_value_func,
+            primary_key=self._primary_key,
+            lag=self.lag,
         )
         for key, value in dict(
             other,
             last_value_func=other.last_value_func,
-            primary_key=other.primary_key,
+            primary_key=other._primary_key,
             lag=other.lag,
         ).items():
             if value is not None:
@@ -275,6 +295,8 @@ class Incremental(
         merged.resource_name = self.resource_name
         if other.resource_name:
             merged.resource_name = other.resource_name
+        if other._dedup_key_from_hints is not None:
+            merged._dedup_key_from_hints = other._dedup_key_from_hints
         # also pass if resolved
         merged.__is_resolved__ = other.__is_resolved__
         merged.__exception__ = other.__exception__
@@ -287,6 +309,38 @@ class Incremental(
     def get_cursor_column_name(self) -> Optional[str]:
         """Return the name of the cursor column if the cursor path resolves to a single column"""
         return extract_simple_field_name(self.cursor_path)
+
+    def resolve_bounds(
+        self, apply_lag: bool = True
+    ) -> Tuple[Optional[TCursorValue], Optional[TCursorValue]]:
+        """Resolve `(lower, upper)` cursor bounds. Works on bound and unbound instances.
+
+        Args:
+            apply_lag (bool): When True, the returned `lower` is the lag-adjusted
+                `start_value` set by `bind()`. When False, the raw `start_value`
+                persisted in cached state is returned.
+
+        Returns:
+            Tuple[Optional[TCursorValue], Optional[TCursorValue]]: `(lower, upper)` bounds.
+        """
+        # upper: explicit end_value beats the live cursor; on unbound, live is None
+        upper = self.end_value
+        if upper is None and self._cached_state is not None:
+            upper = self._cached_state.get("last_value")
+
+        lower: Optional[TCursorValue]
+        if self._cached_state is None:
+            # unbound: no state to read from. lag needs a live last_value to step
+            # back from — there is none — so it is a no-op here regardless of self.lag
+            lower = self.initial_value
+        elif apply_lag:
+            # bind() set self.start_value via `last_value` property, which calls
+            # apply_lag_with_suppression — so this is already lag-adjusted
+            lower = self.start_value
+        else:
+            # raw start as persisted into state by bind()
+            lower = self._cached_state.get("start_value")
+        return lower, upper
 
     def on_resolved(self) -> None:
         compile_path(self.cursor_path)
@@ -369,6 +423,7 @@ class Incremental(
                 "initial_value": self.initial_value,
                 "last_value": self.initial_value,
                 "unique_hashes": [],
+                "start_value": self.initial_value,
             }
 
         if not self.resource_name:
@@ -382,13 +437,14 @@ class Incremental(
                     "initial_value": self.initial_value,
                     "last_value": self.initial_value,
                     "unique_hashes": [],
+                    "start_value": self.initial_value,
                 }
             )
         return self._cached_state
 
     @staticmethod
     def _get_state(resource_name: str, cursor_path: str) -> IncrementalColumnState:
-        """Retrieve the sate from currently active pipeline"""
+        """Retrieve the state from currently active pipeline"""
         state: IncrementalColumnState = (
             resource_state(resource_name).setdefault("incremental", {}).setdefault(cursor_path, {})
         )
@@ -398,25 +454,14 @@ class Incremental(
     @property
     def last_value(self) -> Optional[TCursorValue]:
         s = self.get_state()
-        last_value: TCursorValue = s["last_value"]
-
-        if self.lag:
-            if self.last_value_func not in (max, min):
-                logger.warning(
-                    f"Lag on {self.resource_name} is only supported for max or min last_value_func."
-                    f" Provided: {self.last_value_func}"
-                )
-            elif self.end_value is not None:
-                logger.info(
-                    f"Lag on {self.resource_name} is deactivated if end_value is set in"
-                    " incremental."
-                )
-            elif last_value is not None:
-                last_value = apply_lag(
-                    self.lag, self.initial_value, last_value, self.last_value_func
-                )
-
-        return last_value
+        return apply_lag_with_suppression(  # type: ignore[no-any-return]
+            self.lag,
+            self.last_value_func,
+            self.initial_value,
+            self.end_value,
+            s["last_value"],
+            self.resource_name,
+        )
 
     def _transform_item(
         self, transformer: IncrementalTransform, row: TDataItem
@@ -436,74 +481,86 @@ class Incremental(
         """Infers the type of incremental value from a class of an instance if those preserve the Generic arguments information."""
         return get_generic_type_argument_from_instance(self, self.initial_value)
 
-    def _join_external_scheduler(self) -> None:
-        """Detects existence of external scheduler from which `start_value` and `end_value` are taken. Detects Airflow and environment variables.
-        The logical "start date" coming from external scheduler will set the `initial_value` in incremental. if additionally logical "end date" is
-        present then also "end_value" will be set which means that resource state is not used and exactly this range of date will be loaded
-        """
-        # fit the pendulum into incremental type
+    def _join_external_scheduler(self, ctx: TimeIntervalContext) -> None:
+        """Joins external scheduler interval from TimeIntervalContext."""
+
+        interval = ctx.interval
+        if interval is None:
+            raise ExternalSchedulerNotAvailable(self.resource_name)
+
         param_type = self.get_incremental_value_type()
 
-        try:
-            if param_type is not Any:
-                data_type = py_type_to_sc_type(param_type)
-        except Exception as ex:
-            logger.warning(
-                f"Specified Incremental last value type {param_type} is not supported. Please use"
-                f" DateTime, Date, float, int or str to join external schedulers.({ex})"
-            )
-            return
-
         if param_type is Any:
-            logger.warning(
-                "Could not find the last value type of Incremental class participating in external"
-                " schedule. Please add typing when declaring incremental argument in your resource"
-                " or pass initial_value from which the type can be inferred."
+            raise JoinSchedulerError(
+                self.resource_name,
+                "Could not find the Python data type of Incremental class participating in external"
+                " schedule. Please add type hint when declaring incremental argument in your"
+                " resource or pass default value or initial_value from which the type can be"
+                " inferred.",
             )
-            return
 
-        def _ensure_airflow_end_date(
-            start_date: pendulum.DateTime, end_date: pendulum.DateTime
-        ) -> Optional[pendulum.DateTime]:
-            """if end_date is in the future or same as start date (manual run), set it to None so dlt state is used for incremental loading"""
-            now = pendulum.now()
-            if end_date is None or end_date > now or start_date == end_date:
-                return now
-            return end_date
+        time_coercable_types: Tuple[TDataType, ...] = ("timestamp", "date", "double", "bigint")
+
+        data_type = py_type_to_sc_type(param_type)
+        if data_type not in time_coercable_types:
+            if data_type == "text":
+                str_info = (
+                    " Please convert your cursor field from str to datetime using ie. add_map"
+                    " on resource. dlt "
+                    "will not coerce cursor fields to datetime automatically for comparison. "
+                )
+            else:
+                str_info = ""
+            raise JoinSchedulerError(
+                self.resource_name,
+                "Declared data type of Incremental class must be safely coercable to"
+                f" datetime so they can be compared.{str_info}"
+                f"Incremental data type is {data_type}, coercable data types are"
+                f" {time_coercable_types}. ",
+            )
+
+        # save configured bounds before overwriting with scheduler values
+        configured_initial = self.initial_value
+        configured_end = self.end_value
 
         try:
-            # we can move it to separate module when we have more of those
-            from airflow.operators.python import get_current_context  # noqa
+            start, end = interval
 
-            context = get_current_context()
-            start_date = context["data_interval_start"]
-            end_date = _ensure_airflow_end_date(start_date, context["data_interval_end"])
-            self.initial_value = coerce_from_date_types(data_type, start_date)
-            if end_date is not None:
-                self.end_value = coerce_from_date_types(data_type, end_date)
-            else:
-                self.end_value = None
+            self.initial_value = coerce_from_date_types(data_type, start)
+            self.end_value = coerce_from_date_types(data_type, end)  # end_value must be set
+
+            # adapt scheduler values tz-awareness to match configured bounds
+            if configured_initial is not None and isinstance(self.initial_value, datetime):
+                self.initial_value = IncrementalTransform._adapt_timezone(
+                    configured_initial, self.initial_value, "initial_value", self.resource_name
+                )
+            if configured_end is not None and isinstance(self.end_value, datetime):
+                self.end_value = IncrementalTransform._adapt_timezone(
+                    configured_end, self.end_value, "end_value", self.resource_name
+                )
+
+            # clip scheduler range against configured bounds using last_value_func
+            # same pattern as lag.apply_lag: func((a, b)) == a means a "wins"
+            if configured_initial is not None:
+                if (
+                    self.last_value_func((configured_initial, self.initial_value))
+                    == configured_initial
+                ):
+                    self.initial_value = configured_initial
+            if configured_end is not None:
+                if self.last_value_func((configured_end, self.end_value)) == self.end_value:
+                    self.end_value = configured_end
+
             logger.info(
-                f"Found Airflow scheduler: initial value: {self.initial_value} from"
-                f" data_interval_start {context['data_interval_start']}, end value:"
-                f" {self.end_value} from data_interval_end {context['data_interval_end']}"
+                f"Joined external scheduler: initial value: {self.initial_value},"
+                f" end value: {self.end_value} (raw: {start}, {end})"
             )
-            return
-        except TypeError as te:
-            logger.warning(
-                f"Could not coerce Airflow execution dates into the last value type {param_type}."
-                f" ({te})"
-            )
-        except Exception:
-            pass
-
-        if start_value := os.environ.get("DLT_START_VALUE"):
-            self.initial_value = coerce_value(data_type, "text", start_value)
-            if end_value := os.environ.get("DLT_END_VALUE"):
-                self.end_value = coerce_value(data_type, "text", end_value)
-            else:
-                self.end_value = None
-            return
+        except (TypeError, ValueError) as ex:
+            raise JoinSchedulerError(
+                self.resource_name,
+                "Could not coerce external scheduler dates into last value type"
+                f" {param_type}. ({ex})",
+            ) from ex
 
     def bind(self, pipe: SupportsPipe) -> "Incremental[TCursorValue]":
         """Called by pipe just before evaluation"""
@@ -512,9 +569,13 @@ class Incremental(
             raise IncrementalCursorPathMissing(pipe.name, None, None)
         self.resource_name = pipe.name
         self._bound_pipe = pipe
-        # try to join external scheduler
-        if self.allow_external_schedulers:
-            self._join_external_scheduler()
+        # try to join external scheduler: context flag overrides per-incremental setting
+        ctx = get_interval_context()
+        should_join = self.allow_external_schedulers
+        if ctx.allow_external_schedulers is not None:
+            should_join = ctx.allow_external_schedulers
+        if should_join:
+            self._join_external_scheduler(ctx)
         # set initial value from last value, in case of a new state those are equal
         self.start_value = self.last_value
         logger.info(
@@ -526,6 +587,8 @@ class Incremental(
         )
         # cache state
         self._cached_state = self.get_state()
+        # now cached state is available
+        self._cached_state_start_value = self._cached_state["last_value"]
         # Clear transforms so we get new instances
         self._transformers.clear()
         return self
@@ -579,11 +642,9 @@ class Incremental(
 
     def _get_transform(self, items: TDataItems) -> IncrementalTransform:
         """Gets transform implementation that handles particular data item type"""
-        # Assume list is all of the same type
+        # assume list is all of the same type
         for item in items if isinstance(items, list) else [items]:
-            if is_arrow_item(item):
-                return self._make_or_get_transformer(ArrowIncremental)
-            elif pandas is not None and isinstance(item, pandas.DataFrame):
+            if is_arrow_object(item) or is_pandas_frame(item) or is_polars_frame(item):
                 return self._make_or_get_transformer(ArrowIncremental)
             return self._make_or_get_transformer(JsonIncremental)
         return self._make_or_get_transformer(JsonIncremental)
@@ -595,8 +656,8 @@ class Incremental(
             return rows
 
         # collect metrics
-        self.custom_metrics["unfiltered_items_count"] += count_rows_in_items(rows)
-        self.custom_metrics["unfiltered_batches_count"] += 1
+        self._incremental_metrics["unfiltered_items_count"] += count_rows_in_items(rows)
+        self._incremental_metrics["unfiltered_batches_count"] += 1
 
         transformer = self._get_transform(rows)
         if isinstance(rows, list):
@@ -611,13 +672,16 @@ class Incremental(
         else:
             rows = self._transform_item(transformer, rows)
 
+        cached_state = self._cached_state
         # ensure last_value maintains forward-only progression when lag is applied
-        if self.lag and (cached_last_value := self._cached_state.get("last_value")):
+        if self.lag and (cached_last_value := cached_state.get("last_value")):
             transformer.last_value = self.last_value_func(
                 (transformer.last_value, cached_last_value)
             )
         # writing back state
-        self._cached_state["last_value"] = transformer.last_value
+        cached_state["last_value"] = transformer.last_value
+        if rows is not None:
+            cached_state["start_value"] = self._cached_state_start_value
 
         if transformer.boundary_deduplication:
             # compute hashes for new last rows
@@ -627,19 +691,19 @@ class Incremental(
                 transformer.compute_unique_value(row, self.primary_key)
                 for row in transformer.last_rows
             )
-            initial_hash_list = self._cached_state.get("unique_hashes")
+            initial_hash_list = cached_state.get("unique_hashes")
             initial_hash_count = len(initial_hash_list) if initial_hash_list else 0
-            self.custom_metrics["initial_unique_hashes_count"] = initial_hash_count
+            self._incremental_metrics["initial_unique_hashes_count"] = initial_hash_count
 
             # add directly computed hashes
             unique_hashes.update(transformer.unique_hashes)
-            self._cached_state["unique_hashes"] = list(unique_hashes)
-            final_hash_count = len(self._cached_state["unique_hashes"])
-            self.custom_metrics["final_unique_hashes_count"] = final_hash_count
+            cached_state["unique_hashes"] = list(unique_hashes)
+            final_hash_count = len(cached_state["unique_hashes"])
+            self._incremental_metrics["final_unique_hashes_count"] = final_hash_count
 
             self._check_duplicate_cursor_threshold(initial_hash_count, final_hash_count)
         else:
-            self._cached_state["unique_hashes"] = []
+            cached_state["unique_hashes"] = []
         return rows
 
     def _check_duplicate_cursor_threshold(
@@ -667,23 +731,39 @@ class IncrementalResourceWrapper(ItemTransform[TDataItem, IncrementalCustomMetri
     _incremental: Optional[Incremental[Any]] = None
     """Keeps the injectable incremental"""
     _from_hints: bool = False
-    """If True, incremental was set explicitly from_hints"""
+    """If True, incremental was set explicitly from hints"""
     _resource_name: str = None
 
-    def __init__(self, primary_key: Optional[TTableHintTemplate[TColumnNames]] = None) -> None:
+    def __init__(self) -> None:
         """Creates a wrapper over a resource function that accepts Incremental instance in its argument to perform incremental loading.
 
         The wrapper delays instantiation of the Incremental to the moment of actual execution and is currently used by `dlt.resource` decorator.
         The wrapper explicitly (via `resource_name`) parameter binds the Incremental state to a resource state.
         Note that wrapper implements `FilterItem` transform interface and functions as a processing step in the before-mentioned resource pipe.
-
-        Args:
-            primary_key (TTableHintTemplate[TColumnKey], optional): A primary key to be passed to Incremental Instance at execution. Defaults to None.
         """
-        self.primary_key = primary_key
+        self._primary_key: Optional[TTableHintTemplate[TColumnNames]] = None
         self.incremental_state: IncrementalColumnState = None
         self._allow_external_schedulers: bool = None
         self._bound_pipe: SupportsPipe = None
+
+    @property
+    def primary_key(self) -> Optional[TTableHintTemplate[TColumnNames]]:
+        return self._primary_key
+
+    @primary_key.setter
+    def primary_key(self, value: Optional[TTableHintTemplate[TColumnNames]]) -> None:
+        if self._incremental is not None:
+            self._incremental.set_deduplication_key(value, from_hints=True)
+            self._primary_key = self._incremental.primary_key
+        else:
+            self._primary_key = value
+
+    def set_deduplication_key(
+        self, value: Optional[TTableHintTemplate[TColumnNames]], from_hints: Literal[True]
+    ) -> None:
+        """Set deduplication key, wrapper is always called from resource so from_hints must be always True"""
+        assert from_hints is True
+        self.primary_key = value
 
     @staticmethod
     def should_wrap(sig: inspect.Signature) -> bool:
@@ -741,6 +821,11 @@ class IncrementalResourceWrapper(ItemTransform[TDataItem, IncrementalCustomMetri
             new_incremental: Incremental[Any] = None
             bound_args = sig.bind(*args, **kwargs)
 
+            # self._incremental is passed via apply_hints or via decorator
+            # and it is used as explicit value if not provided by user
+            if self._incremental and p.name not in bound_args.arguments:
+                bound_args.arguments[p.name] = self._incremental
+
             if p.name in bound_args.arguments:
                 explicit_value = bound_args.arguments[p.name]
                 if explicit_value is Incremental.EMPTY or p.default is Incremental.EMPTY:
@@ -770,14 +855,15 @@ class IncrementalResourceWrapper(ItemTransform[TDataItem, IncrementalCustomMetri
                     f"`{p.name}` incremental argument has no default. Please wrap its typing in"
                     " `Optional[]` to allow no incremental"
                 )
-            # pass Generic information from annotation to new_incremental
+            # pass Generic information from annotation
+            target = new_incremental or self._incremental
             if (
-                new_incremental
-                and not hasattr(new_incremental, "__orig_class__")
+                target
+                and not hasattr(target, "__orig_class__")
                 and p.annotation
                 and get_args(p.annotation)
             ):
-                new_incremental.__orig_class__ = p.annotation
+                target.__orig_class__ = p.annotation
 
             # set the incremental only if not yet set or if it was passed explicitly
             # NOTE: the _incremental may be also set by applying hints to the resource see `set_template` in `DltResource`
@@ -810,6 +896,12 @@ class IncrementalResourceWrapper(ItemTransform[TDataItem, IncrementalCustomMetri
             incremental = Incremental.ensure_instance(incremental)
         self._from_hints = from_hints
         self._incremental = incremental
+        # sync primary_key between wrapper and inner incremental
+        if incremental is not None:
+            if self._primary_key is not None:
+                incremental.set_deduplication_key(self._primary_key, from_hints=True)
+            if incremental._primary_key is not None:
+                self._primary_key = incremental.primary_key
 
     @property
     def allow_external_schedulers(self) -> bool:
@@ -845,11 +937,6 @@ class IncrementalResourceWrapper(ItemTransform[TDataItem, IncrementalCustomMetri
     def __call__(self, item: TDataItems, meta: Any = None) -> Optional[TDataItems]:
         if not self._incremental:
             return item
-        if self._incremental.primary_key is None:
-            self._incremental.primary_key = self.primary_key
-        elif self.primary_key is None:
-            # propagate from incremental
-            self.primary_key = self._incremental.primary_key
         return self._incremental(item, meta)
 
 

@@ -1,6 +1,16 @@
 from __future__ import annotations
-
-from typing import overload, Union, Any, Generator, Optional, Sequence, Type, TYPE_CHECKING
+from collections.abc import Collection, Sequence
+from functools import partial
+from typing import (
+    overload,
+    Union,
+    Any,
+    Generator,
+    Optional,
+    Type,
+    TYPE_CHECKING,
+    Literal,
+)
 from textwrap import indent
 from contextlib import contextmanager
 from dlt.common.utils import simple_repr, without_none
@@ -14,19 +24,26 @@ import sqlglot.expressions as sge
 import dlt
 from dlt.common.destination.dataset import TFilterOperation
 from dlt.common.libs.sqlglot import to_sqlglot_type, build_typed_literal, TSqlGlotDialect
-from dlt.common.libs.utils import is_instance_lib
-from dlt.common.schema.typing import TTableSchema, TTableSchemaColumns
-from dlt.common.typing import Self, TSortOrder
+from dlt.common.libs import is_instance_lib
+from dlt.common.schema.typing import (
+    TTableSchema,
+    TTableSchemaColumns,
+    C_DLT_LOAD_ID,
+)
+from dlt.common.schema import utils as schema_utils
+from dlt.common.typing import Self, TSortOrder, TypedDict
 from dlt.common.exceptions import ValueErrorWithKnownValues
 from dlt.dataset import lineage
 from dlt.destinations.sql_client import SqlClientBase, WithSqlClient
-from dlt.destinations.queries import _normalize_query, build_select_expr
-from dlt.common.exceptions import MissingDependencyException
+from dlt.destinations.queries import bind_query, build_select_expr
 from dlt.common.destination.dataset import SupportsDataAccess
+from dlt.dataset._join import _apply_join
 
 
 if TYPE_CHECKING:
-    from ibis import ir
+    from dlt.common.libs.ibis import ir
+    from dlt.common.libs.pandas import pandas as pd
+    from dlt.common.libs.pyarrow import pyarrow as pa
     from dlt.helpers.ibis import Expr as IbisExpr
 
 
@@ -40,6 +57,9 @@ _FILTER_OP_MAP = {
     "in": sge.In,
     "not_in": sge.Not,
 }
+
+
+TJoinType = Literal["left", "right", "inner", "full"]
 
 
 class Relation(WithSqlClient):
@@ -87,47 +107,38 @@ class Relation(WithSqlClient):
         self._sqlglot_expression: sge.Query = None
         self._schema: Optional[TTableSchemaColumns] = None
 
-    def _wrap_iter(self, func_name: str) -> Any:
-        """wrap Relation generators in cursor context"""
+    def df(self, *args: Any, **kwargs: Any) -> pd.DataFrame | None:
+        with self._cursor() as cursor:
+            return cursor.df(*args, **kwargs)
 
-        def _wrap(*args: Any, **kwargs: Any) -> Any:
-            with self._cursor() as cursor:
-                yield from getattr(cursor, func_name)(*args, **kwargs)
+    def arrow(self, *args: Any, **kwargs: Any) -> pa.Table | None:
+        with self._cursor() as cursor:
+            return cursor.arrow(*args, **kwargs)
 
-        return _wrap
+    def fetchall(self, *args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
+        with self._cursor() as cursor:
+            return cursor.fetchall(*args, **kwargs)
 
-    def _wrap_func(self, func_name: str) -> Any:
-        """wrap Relation functions in cursor context"""
+    def fetchmany(self, *args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
+        with self._cursor() as cursor:
+            return cursor.fetchmany(*args, **kwargs)
 
-        def _wrap(*args: Any, **kwargs: Any) -> Any:
-            with self._cursor() as cursor:
-                return getattr(cursor, func_name)(*args, **kwargs)
+    def fetchone(self, *args: Any, **kwargs: Any) -> tuple[Any, ...] | None:
+        with self._cursor() as cursor:
+            return cursor.fetchone(*args, **kwargs)
 
-        return _wrap
+    def iter_df(self, *args: Any, **kwargs: Any) -> Generator[pd.DataFrame, None, None]:
+        with self._cursor() as cursor:
+            yield from cursor.iter_df(*args, **kwargs)
 
-    def df(self, *args: Any, **kwargs: Any) -> Any:
-        return self._wrap_func("df")(*args, **kwargs)
+    # TODO maybe it should return record batches
+    def iter_arrow(self, *args: Any, **kwargs: Any) -> Generator[pa.Table, None, None]:
+        with self._cursor() as cursor:
+            yield from cursor.iter_arrow(*args, **kwargs)
 
-    def arrow(self, *args: Any, **kwargs: Any) -> Any:
-        return self._wrap_func("arrow")(*args, **kwargs)
-
-    def fetchall(self, *args: Any, **kwargs: Any) -> Any:
-        return self._wrap_func("fetchall")(*args, **kwargs)
-
-    def fetchmany(self, *args: Any, **kwargs: Any) -> Any:
-        return self._wrap_func("fetchmany")(*args, **kwargs)
-
-    def fetchone(self, *args: Any, **kwargs: Any) -> Any:
-        return self._wrap_func("fetchone")(*args, **kwargs)
-
-    def iter_df(self, *args: Any, **kwargs: Any) -> Any:
-        return self._wrap_iter("iter_df")(*args, **kwargs)
-
-    def iter_arrow(self, *args: Any, **kwargs: Any) -> Any:
-        return self._wrap_iter("iter_arrow")(*args, **kwargs)
-
-    def iter_fetch(self, *args: Any, **kwargs: Any) -> Any:
-        return self._wrap_iter("iter_fetch")(*args, **kwargs)
+    def iter_fetch(self, *args: Any, **kwargs: Any) -> Generator[list[tuple[Any, ...]], None, None]:
+        with self._cursor() as cursor:
+            yield from cursor.iter_fetch(*args, **kwargs)
 
     @property
     def columns_schema(self) -> TTableSchemaColumns:
@@ -242,10 +253,14 @@ class Relation(WithSqlClient):
             query = self.sqlglot_expression
         else:
             _, _qualified_query = _get_relation_output_columns_schema(self)
-            query = _normalize_query(
+            query = bind_query(
                 qualified_query=_qualified_query,
                 sqlglot_schema=self._dataset.sqlglot_schema,
-                sql_client=self.sql_client,
+                expand_table_name=partial(
+                    self.sql_client.make_qualified_table_name_path,
+                    quote=False,
+                    casefold=False,
+                ),
                 casefold_identifier=self.sql_client.capabilities.casefold_identifier,
             )
 
@@ -285,7 +300,7 @@ class Relation(WithSqlClient):
 
         backend = _DltBackend.from_dataset(self._dataset)
 
-        if self._table_name:
+        if self._table_name and self._query is None:
             ibis_table = backend.table(self._table_name)
         else:
             # pass raw query before any identifiers are expanded, quoted or normalized
@@ -306,13 +321,16 @@ class Relation(WithSqlClient):
         """
         return self.limit(limit)
 
-    def select(self, *columns: str) -> Self:
-        """CReate a `Relation` with the selected columns using a `SELECT` clause."""
+    def select(self, *columns: str, _allow_merge_subqueries: bool = True) -> Self:
+        """Create a `Relation` with the selected columns using a `SELECT` clause."""
         proj = [sge.Column(this=sge.to_identifier(col, quoted=True)) for col in columns]
         subquery = self.sqlglot_expression.subquery()
         new_expr = sge.select(*proj).from_(subquery)
         rel = self.__copy__()
-        rel._sqlglot_expression = merge_subqueries(new_expr)
+        if _allow_merge_subqueries:
+            rel._sqlglot_expression = merge_subqueries(new_expr)
+        else:
+            rel._sqlglot_expression = new_expr
         return rel
 
     def order_by(self, column_name: str, direction: TSortOrder = "asc") -> Self:
@@ -337,6 +355,87 @@ class Relation(WithSqlClient):
         )
         rel = self.__copy__()
         rel._sqlglot_expression = rel.sqlglot_expression.order_by(order_expr)
+        return rel
+
+    def join(
+        self,
+        other: str | Self,
+        *,
+        kind: TJoinType = "inner",
+        alias: Optional[str] = None,
+    ) -> Self:
+        """Join this relation to another table using dlt schema references.
+
+        Join conditions are discovered automatically from the schema's reference
+        chain (parent/child/root relationships created by dlt during loading).
+        Both the current relation and ``other`` must be base-table relations
+        (i.e., created via ``dataset[table_name]``, not transformed with
+        ``.select()``/``.where()`` etc.).
+
+        This method is designed for the common case of navigating dlt's
+        built-in table hierarchy. For more complex join scenarios — such as
+        custom join predicates, joining on non-reference columns, self-joins,
+        or multi-way joins with mixed conditions — use ``Relation.to_ibis()``
+        to obtain an ibis table expression and construct the join manually::
+
+            t1 = dataset["orders"].to_ibis()
+            t2 = dataset["products"].to_ibis()
+            joined = t1.join(t2, t1.product_id == t2.id, how="left")
+
+        Args:
+            other: Table name or base-table relation to join.
+            kind: Type of SQL join: ``"inner"``, ``"left"``, ``"right"``,
+                or ``"full"``.
+            alias: Projection prefix for the joined table's columns. Columns
+                from ``other`` appear as ``{alias}__{column}``. Defaults to
+                the target table name.
+
+        Returns:
+            A new relation with the join(s) applied and the target table's
+            columns appended to the projection.
+
+        Raises:
+            ValueError: If schema references between the two tables cannot be
+                resolved, or if either relation is not join-eligible.
+        """
+        if alias == "":
+            raise ValueError("`alias` must be a non-empty string when provided.")
+
+        if not self._table_name:
+            raise ValueError("This relation has no base table to resolve references.")
+
+        if isinstance(other, dlt.Relation):
+            # TODO: remove once we allow cross-dataset joins
+            if not (
+                self._dataset.is_same_physical_destination(other._dataset)
+                and self._dataset.dataset_name == other._dataset.dataset_name
+            ):
+                raise ValueError(
+                    "Cannot join relations from different datasets: "
+                    f"'{other._dataset.dataset_name}' vs '{self._dataset.dataset_name}'"
+                )
+            target_table = other._table_name
+            if not target_table:
+                raise ValueError(f"Relation `{other}` has no base table to resolve references.")
+        else:
+            target_table = other
+
+        if not target_table or not isinstance(target_table, str):
+            raise ValueError("`other` must be a table name or a base table relation.")
+        if target_table not in self._dataset.schema.tables:
+            raise ValueError(f"Table `{target_table}` not found in dataset schema")
+
+        projection_prefix = alias or target_table
+        query = _apply_join(
+            self.sqlglot_expression,
+            schema=self._dataset.schema,
+            left_table=self._table_name,
+            right_table=target_table,
+            projection_prefix=projection_prefix,
+            kind=kind,
+        )
+        rel = self.__copy__()
+        rel._sqlglot_expression = query
         return rel
 
     # NOTE we currently force to have one column selected; we could be more flexible
@@ -486,6 +585,82 @@ class Relation(WithSqlClient):
         assert isinstance(column_or_expr, str)
         return self.where(column_or_expr=column_or_expr, operator=operator, value=value)
 
+    # TODO could be refactored to join any column from `_dlt_loads` table
+    def with_load_id_col(self) -> dlt.Relation:
+        """Return the relation with the `_dlt_load_id` included.
+
+        This only works on relations created via `.table()`.
+
+        If the relation already includes `_dlt_load_id`, it is returned unchanged.
+        Otherwise, the root table is joined to add the column to the current relation.
+
+        Raises:
+            ValueError: If called on a non-table relation, a root table without
+                `_dlt_load_id`, or a relation whose root load ID column cannot be located.
+        """
+        if not self._table_name or self._query is not None:
+            raise ValueError(
+                "`with_load_id_col()` only works on relations created via .table()."
+                " It can't be applied to arbitrary relation."
+            )
+
+        normalized_load_id = self._dataset.schema.naming.normalize_identifier(C_DLT_LOAD_ID)
+
+        if normalized_load_id in self.columns:
+            return self
+
+        root_table_name = schema_utils.get_root_table(
+            self._dataset.schema.tables, self._table_name
+        )["name"]
+        if root_table_name == self._table_name:
+            raise ValueError(f"{root_table_name} is a root table, but load id column is not present.")
+
+        join_alias = "_dlt_root"
+        joined = self.join(root_table_name, alias=join_alias)
+        joined_expression = joined.sqlglot_expression.copy()
+        left_projection = joined_expression.selects[: len(self.sqlglot_expression.selects)]
+        load_id_output_name = f"{join_alias}__{normalized_load_id}"
+        load_id_expr = next(
+            (expr for expr in joined_expression.selects if expr.output_name == load_id_output_name),
+            None,
+        )
+        if load_id_expr is None:
+            raise ValueError(f"Could not locate column {normalized_load_id}")
+
+        joined_expression.set("expressions", [*left_projection, load_id_expr.this.copy()])
+
+        rel = self.__copy__()
+        rel._sqlglot_expression = joined_expression
+        return rel
+
+    def from_loads(
+        self,
+        load_ids: Collection[str],
+        add_load_id_column: bool = False,
+    ) -> dlt.Relation:
+        """Filter the table to rows associated with `load_ids`.
+
+        This resolves the `_dlt_load_id` column then filters rows of the
+        current relation. `include_load_id` allows to keep the `_dlt_load_id` column
+        or exclude it after filtering.
+        """
+        if not self._table_name or self._query is not None:
+            raise ValueError(
+                "`from_loads()` only works on relations created via .table()."
+                " It can't be applied to arbitrary relation."
+            )
+
+        initial_columns = self.columns
+        normalized_load_id = self._dataset.schema.naming.normalize_identifier(C_DLT_LOAD_ID)
+        filtered_rel_with_load_id = self.with_load_id_col().where(
+            normalized_load_id, "in", load_ids
+        )
+        return (
+            filtered_rel_with_load_id
+            if add_load_id_column
+            else filtered_rel_with_load_id.select(*initial_columns, _allow_merge_subqueries=False)
+        )
+
     # TODO move this to the WithSqlClient / data accessor mixin.
     def fetchscalar(self) -> Any:
         """Execute the relation and return the first value of first column as a Python primitive"""
@@ -544,7 +719,9 @@ class Relation(WithSqlClient):
         return simple_repr("dlt.Relation", **without_none(kwargs))
 
     def __copy__(self) -> Self:
-        return self.__class__(dataset=self._dataset, query=self.sqlglot_expression)
+        rel = self.__class__(dataset=self._dataset, query=self.sqlglot_expression)
+        rel._table_name = self._table_name
+        return rel
 
 
 def _get_relation_output_columns_schema(

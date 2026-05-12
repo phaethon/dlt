@@ -2,14 +2,27 @@ import pytest
 import os
 import time
 from datetime import datetime, date, timezone, timedelta, time as dt_time  # noqa: I251
-from pendulum.tz import UTC, fixed_timezone
+from pendulum.tz import UTC, FixedTimezone, Timezone, fixed_timezone
 from contextlib import contextmanager
+from datetime import datetime, date, timezone, timedelta, time as dt_time  # noqa: I251
+from unittest import mock
+from zoneinfo import ZoneInfo
+
+from pendulum.tz import UTC, fixed_timezone
 
 from dlt.common import pendulum
+from dlt.common.storages.load_package import create_load_id
 from dlt.common.time import (
+    MonotonicPreciseTime,
+    LockedMonotonicPreciseTime,
+    increasing_precise_time,
+    precise_time,
     parse_iso_like_datetime,
     timestamp_before,
     timestamp_within,
+    ensure_datetime,
+    ensure_datetime_in_tz,
+    ensure_datetime_utc,
     ensure_pendulum_datetime_utc,
     ensure_pendulum_date,
     datetime_to_timestamp,
@@ -18,9 +31,9 @@ from dlt.common.time import (
     ensure_pendulum_datetime_non_utc,
     ensure_pendulum_time,
     normalize_timezone,
+    datetime_obj_to_str,
 )
 from dlt.common.typing import TAnyDateTime
-from dlt.common.time import datetime_obj_to_str
 
 
 @contextmanager
@@ -260,12 +273,12 @@ def test_ensure_pendulum_datetime_non_utc(
 
         def _test_tz(dt_: pendulum.DateTime) -> None:
             # timezone awareness preserved
-            if dt.tzinfo or expected_non_utc.tzinfo:
-                assert dt.tzinfo.utcoffset(dt) == expected_non_utc.tzinfo.utcoffset(
+            if dt_.tzinfo or expected_non_utc.tzinfo:
+                assert dt_.tzinfo.utcoffset(dt_) == expected_non_utc.tzinfo.utcoffset(
                     expected_non_utc
                 )
             else:
-                assert dt.tz is expected_non_utc.tz is None
+                assert dt_.tz is expected_non_utc.tz is None
 
         _test_tz(dt)
         # always pendulum
@@ -763,3 +776,305 @@ def test_ensure_pendulum_time_invalid(value) -> None:
     else:
         with pytest.raises(TypeError):
             ensure_pendulum_time(value)
+
+
+@pytest.mark.parametrize(
+    "value, expected_offset_hours",
+    [
+        (datetime(2021, 1, 1, 12, 0, 0, tzinfo=timezone(timedelta(hours=5))), 5),
+        (datetime(2021, 1, 1, 12, 0, 0, tzinfo=timezone(timedelta(hours=-8))), -8),
+        (datetime(2021, 1, 1, 12, 0, 0, tzinfo=timezone.utc), 0),
+        (datetime(2021, 6, 15, 12, 0, 0, tzinfo=timezone(timedelta(hours=5, minutes=30))), 5.5),
+    ],
+    ids=["plus5", "minus8", "utc", "plus5:30"],
+)
+def test_ensure_pendulum_datetime_non_utc_produces_pendulum_tzinfo(
+    value, expected_offset_hours
+) -> None:
+    """stdlib timezone inputs must produce pendulum-native tzinfo with correct offset."""
+    result = ensure_pendulum_datetime_non_utc(value)
+    assert isinstance(result, pendulum.DateTime)
+    assert result.tzinfo is not None
+    # must be pendulum-native, not stdlib
+    assert isinstance(
+        result.tzinfo, (FixedTimezone, Timezone)
+    ), f"Expected pendulum tz, got {type(result.tzinfo).__name__}: {result.tzinfo}"
+    assert result.tzinfo.utcoffset(result) == timedelta(hours=expected_offset_hours)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        datetime(2021, 1, 1, 12, 0, 0, tzinfo=timezone(timedelta(hours=5))),
+        datetime(2021, 1, 1, 12, 0, 0, tzinfo=timezone(timedelta(hours=-8))),
+        datetime(2021, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+    ],
+    ids=["plus5", "minus8", "utc"],
+)
+def test_ensure_pendulum_datetime_non_utc_add_preserves_tz(value) -> None:
+    """pendulum .add() and stdlib timedelta must keep the original tz offset."""
+    result = ensure_pendulum_datetime_non_utc(value)
+    original_offset = result.tzinfo.utcoffset(result)
+
+    # pendulum .add()
+    added = result.add(days=1, hours=2)
+    assert added.tzinfo is not None, "add() produced naive datetime"
+    assert added.tzinfo.utcoffset(added) == original_offset
+
+    # python timedelta
+    td_added = result + timedelta(days=1, hours=2)
+    assert td_added.tzinfo is not None, "timedelta addition produced naive datetime"
+    assert td_added.tzinfo.utcoffset(td_added) == original_offset
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        datetime(2021, 1, 1, 12, 0, 0, tzinfo=timezone(timedelta(hours=5))),
+        datetime(2021, 1, 1, 12, 0, 0, tzinfo=timezone(timedelta(hours=-8))),
+        datetime(2021, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+    ],
+    ids=["plus5", "minus8", "utc"],
+)
+def test_ensure_pendulum_datetime_non_utc_add_then_format(value) -> None:
+    """after .add(), datetime_obj_to_str with %:z must not raise on tz formatting."""
+    result = ensure_pendulum_datetime_non_utc(value)
+    added = result.add(hours=1)
+    # must not raise ValueError about missing timezone
+    formatted = datetime_obj_to_str(added, "%Y-%m-%dT%H:%M:%S%:z")
+    assert "+" in formatted or "-" in formatted
+
+
+@pytest.mark.parametrize(
+    "value, expected_hour",
+    [
+        (datetime(2021, 1, 1, 12, 0, 0, tzinfo=timezone(timedelta(hours=5))), 7),
+        (datetime(2021, 1, 1, 12, 0, 0, tzinfo=timezone(timedelta(hours=-8))), 20),
+        (datetime(2021, 1, 1, 12, 0, 0, tzinfo=timezone.utc), 12),
+    ],
+    ids=["plus5", "minus8", "utc"],
+)
+def test_ensure_pendulum_datetime_utc_add_preserves_utc(value, expected_hour) -> None:
+    """UTC conversion must shift the hour correctly and survive .add() arithmetic."""
+    result = ensure_pendulum_datetime_utc(value)
+    assert result.hour == expected_hour
+    assert result.tz == UTC
+    assert result.add(days=1).tz == UTC
+
+
+@pytest.mark.parametrize(
+    "value, expected_date",
+    [
+        # +8h: 2021-01-01T00:00+08:00 = 2020-12-31T16:00 UTC
+        (
+            datetime(2021, 1, 1, 0, 0, 0, tzinfo=timezone(timedelta(hours=8))),
+            pendulum.date(2020, 12, 31),
+        ),
+        # -8h: 2021-01-01T00:00-08:00 = 2021-01-01T08:00 UTC
+        (
+            datetime(2021, 1, 1, 0, 0, 0, tzinfo=timezone(timedelta(hours=-8))),
+            pendulum.date(2021, 1, 1),
+        ),
+        (
+            datetime(2021, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+            pendulum.date(2021, 1, 1),
+        ),
+    ],
+    ids=["plus8-crosses-date", "minus8-same-date", "utc"],
+)
+def test_ensure_pendulum_date_stdlib_timezone(value, expected_date) -> None:
+    """stdlib timezone offsets crossing midnight must shift the date accordingly."""
+    result = ensure_pendulum_date(value)
+    assert result == expected_date
+
+
+@pytest.mark.parametrize(
+    "clock_cls",
+    [MonotonicPreciseTime, LockedMonotonicPreciseTime],
+    ids=["unlocked", "locked"],
+)
+def test_monotonic_precise_time_never_goes_backward(clock_cls: type) -> None:
+    clock = clock_cls()
+    values = [clock() for _ in range(10_000)]
+    for i in range(1, len(values)):
+        assert values[i] >= values[i - 1], f"went backward at index {i}"
+
+
+@pytest.mark.parametrize(
+    "clock_cls",
+    [MonotonicPreciseTime, LockedMonotonicPreciseTime],
+    ids=["unlocked", "locked"],
+)
+def test_monotonic_precise_time_tracks_wall_clock(clock_cls: type) -> None:
+    clock = clock_cls()
+    m = clock()
+    w = precise_time()
+    # should be within 100ms of wall clock
+    assert abs(m - w) < 0.1, f"monotonic {m} too far from wall {w}"
+
+
+@pytest.mark.parametrize(
+    "clock_cls",
+    [MonotonicPreciseTime, LockedMonotonicPreciseTime],
+    ids=["unlocked", "locked"],
+)
+def test_monotonic_precise_time_survives_backward_step(clock_cls: type) -> None:
+    """Simulate a wall-clock backward jump and verify the high-water mark holds."""
+    clock = clock_cls()
+    t0 = clock()
+
+    # simulate clock jumping backward by 5 seconds
+    with mock.patch("dlt.common.time.precise_time", return_value=t0 - 5.0):
+        t1 = clock()
+    assert t1 == t0, "clock must return high-water mark when wall clock goes backward"
+
+    # after the backward step, a normal reading must still be >= high-water mark
+    t2 = clock()
+    assert t2 >= t0
+
+
+@pytest.mark.parametrize(
+    "clock_cls",
+    [MonotonicPreciseTime, LockedMonotonicPreciseTime],
+    ids=["unlocked", "locked"],
+)
+def test_strictly_increasing_advances_on_frozen_clock(clock_cls: type) -> None:
+    """With strictly_increasing=True, every call returns a strictly greater value."""
+    clock = clock_cls(strictly_increasing=True)
+    t0 = clock()
+
+    # freeze wall clock at current value
+    with mock.patch("dlt.common.time.precise_time", return_value=t0):
+        values = [clock() for _ in range(50)]
+
+    for i in range(1, len(values)):
+        assert values[i] > values[i - 1], f"not strictly increasing at index {i}"
+
+    # values should still be very close to wall clock (nextafter increments)
+    assert values[-1] - t0 < 0.001
+
+
+def test_increasing_precise_time_is_strictly_increasing() -> None:
+    """Module-level increasing_precise_time must produce unique values."""
+    assert isinstance(increasing_precise_time, LockedMonotonicPreciseTime)
+    values = [increasing_precise_time() for _ in range(100)]
+    for i in range(1, len(values)):
+        assert values[i] > values[i - 1], f"not strictly increasing at index {i}"
+
+
+def test_create_load_id_strictly_increasing() -> None:
+    """create_load_id must return strictly increasing values even under clock jitter."""
+    ids = [create_load_id() for _ in range(100)]
+    for i in range(1, len(ids)):
+        assert float(ids[i]) > float(
+            ids[i - 1]
+        ), f"load id not strictly increasing at index {i}: {ids[i - 1]} >= {ids[i]}"
+
+    # simulate a backward jump: mock the module-level singleton
+    baseline = float(create_load_id())
+    with mock.patch(
+        "dlt.common.storages.load_package.increasing_precise_time",
+        return_value=baseline - 10.0,
+    ):
+        backward_id = float(create_load_id())
+    assert backward_id == baseline - 10.0  # mock fully replaces the callable
+
+    # after removing the mock the real singleton still has its high-water mark
+    restored = float(create_load_id())
+    assert restored >= baseline
+
+
+@pytest.mark.parametrize(
+    "fn, args",
+    [
+        (ensure_datetime, ("2021-01-01T12:00:00+02:00",)),
+        (ensure_datetime_utc, ("2021-01-01T12:00:00+02:00",)),
+        (ensure_datetime_in_tz, ("2021-01-01T12:00:00+02:00", ZoneInfo("Europe/Berlin"))),
+    ],
+    ids=["ensure_datetime", "ensure_datetime_utc", "ensure_datetime_in_tz"],
+)
+def test_ensure_datetime_helpers_return_stdlib(fn, args) -> None:
+    """All three helpers return stdlib `datetime.datetime`, not `pendulum.DateTime`."""
+    result = fn(*args)
+    # `type(...) is` not `isinstance(...)`: pendulum.DateTime is a datetime subclass
+    assert type(result) is datetime
+
+
+@pytest.mark.parametrize(
+    "value, default_tz, expected",
+    [
+        # naive + Berlin (UTC+1 in January) → 11:00 UTC
+        (
+            "2021-01-15T12:00:00",
+            ZoneInfo("Europe/Berlin"),
+            datetime(2021, 1, 15, 11, tzinfo=timezone.utc),
+        ),
+        # naive + default_tz omitted → naive treated as UTC (regression guard)
+        (
+            "2021-01-15T12:00:00",
+            None,
+            datetime(2021, 1, 15, 12, tzinfo=timezone.utc),
+        ),
+        # aware input ignores default_tz: only the input's own +02:00 offset matters
+        (
+            datetime(2021, 1, 15, 12, tzinfo=timezone(timedelta(hours=2))),
+            ZoneInfo("Asia/Tokyo"),
+            datetime(2021, 1, 15, 10, tzinfo=timezone.utc),
+        ),
+    ],
+    ids=["naive-with-berlin", "naive-default-utc", "aware-ignores-default"],
+)
+def test_ensure_datetime_utc_default_tz(value, default_tz, expected: datetime) -> None:
+    """`default_tz` is the interpretation for naive inputs only; aware inputs ignore it."""
+    if default_tz is None:
+        result = ensure_datetime_utc(value)
+    else:
+        result = ensure_datetime_utc(value, default_tz=default_tz)
+    assert result == expected
+    assert result.tzinfo == timezone.utc
+
+
+@pytest.mark.parametrize(
+    "value, tz, expected_wall_clock",
+    [
+        # naive str → wall-clock preserved, tz attached
+        ("2021-01-15T12:00:00", ZoneInfo("Europe/Berlin"), (2021, 1, 15, 12, 0)),
+        # naive datetime → same
+        (datetime(2021, 1, 15, 12, 0), ZoneInfo("Asia/Kolkata"), (2021, 1, 15, 12, 0)),
+        # aware utc → converted to Berlin (UTC+1 in January)
+        (
+            datetime(2021, 1, 15, 12, tzinfo=timezone.utc),
+            ZoneInfo("Europe/Berlin"),
+            (2021, 1, 15, 13, 0),
+        ),
+        # aware string +05:00 → converted to Tokyo (+09:00) → +4h
+        ("2021-01-15T12:00:00+05:00", ZoneInfo("Asia/Tokyo"), (2021, 1, 15, 16, 0)),
+    ],
+    ids=[
+        "naive-str-attach",
+        "naive-datetime-attach",
+        "aware-convert-to-berlin",
+        "aware-string-convert-to-tokyo",
+    ],
+)
+def test_ensure_datetime_in_tz(value, tz, expected_wall_clock) -> None:
+    """Naive inputs get `tz` attached; aware inputs are converted to `tz`."""
+    result = ensure_datetime_in_tz(value, tz)
+    assert result.tzinfo is tz
+    assert (
+        result.year,
+        result.month,
+        result.day,
+        result.hour,
+        result.minute,
+    ) == expected_wall_clock
+
+
+def test_ensure_datetime_preserves_tz_and_naive() -> None:
+    """Sanity: `ensure_datetime` keeps original tz and leaves naive inputs naive."""
+    aware = ensure_datetime("2021-01-15T12:00:00+05:00")
+    assert aware.tzinfo is not None
+    assert aware.utcoffset() == timedelta(hours=5)
+
+    naive = ensure_datetime("2021-01-15T12:00:00")
+    assert naive.tzinfo is None

@@ -1,7 +1,8 @@
 import os
 import base64
 from copy import copy
-from typing import Any, Iterator, Tuple, cast, Dict
+from typing import Any, Iterator, Tuple, Type, cast, Dict
+from unittest.mock import MagicMock
 import pytest
 
 from dlt.common import json, pendulum, Decimal
@@ -20,13 +21,21 @@ from dlt.common.schema.utils import new_table
 from dlt.common.storages import FileStorage
 from dlt.common.utils import digest128, uniq_id, custom_environ
 from dlt.common.destination.client import RunnableLoadJob
-from dlt.destinations.impl.bigquery.bigquery import BigQueryClient, BigQueryClientConfiguration
+from dlt.destinations.impl.bigquery.bigquery import (
+    BigQueryClient,
+    BigQueryClientConfiguration,
+    BigQueryLoadJob,
+)
+from dlt.destinations.exceptions import (
+    DatabaseTransientException,
+    DatabaseTerminalException,
+)
 
 from dlt.destinations.impl.bigquery.bigquery_adapter import (
     AUTODETECT_SCHEMA_HINT,
     should_autodetect_schema,
 )
-from tests.utils import TEST_STORAGE_ROOT, delete_test_storage
+from tests.utils import get_test_storage_root, delete_test_storage
 from tests.common.utils import json_case_path as common_json_case_path
 from tests.common.configuration.utils import environment
 from tests.load.utils import (
@@ -40,6 +49,8 @@ from tests.load.utils import (
 # mark all tests as essential, do not remove
 pytestmark = pytest.mark.essential
 
+TEST_FILE_PATH = "/tmp/test_table.abc123.0.jsonl"
+
 
 @pytest.fixture(scope="module")
 def client() -> Iterator[BigQueryClient]:
@@ -48,7 +59,7 @@ def client() -> Iterator[BigQueryClient]:
 
 @pytest.fixture
 def file_storage() -> FileStorage:
-    return FileStorage(TEST_STORAGE_ROOT, file_type="b", makedirs=True)
+    return FileStorage(get_test_storage_root(), file_type="b", makedirs=True)
 
 
 @pytest.fixture(autouse=True)
@@ -462,3 +473,113 @@ def prepare_service_json() -> Tuple[str, str]:
         services_str = base64.b64decode(f.read().strip(), validate=True).decode()
     dest_path = storage.save("level-dragon-333019-707809ee408a.json", services_str)
     return services_str, dest_path
+
+
+def test_bigquery_configuration_accepts_oauth_credentials() -> None:
+    # Create OAuth credentials
+    oauth_creds = GcpOAuthCredentials()
+    oauth_creds.project_id = "test-project"
+    oauth_creds.token = "test-token"
+    oauth_creds.client_id = ""
+    oauth_creds.refresh_token = ""
+    oauth_creds.resolve()
+
+    # Test that configuration accepts OAuth credentials
+    config = BigQueryClientConfiguration(credentials=oauth_creds)._bind_dataset_name(
+        dataset_name="test_dataset"
+    )
+
+    assert config.credentials == oauth_creds
+    assert config.credentials.project_id == "test-project"
+
+
+def test_bigquery_configuration_accepts_base_gcp_credentials() -> None:
+    from google.oauth2.credentials import Credentials as GoogleOAuth2Credentials
+
+    # Create a wrapper that uses base GcpCredentials type
+    # This mimics what happens with Workload Identity Federation
+    native_credentials = GoogleOAuth2Credentials(token="test-token")
+    native_credentials.expiry = None  # Non-refreshable
+
+    # Wrap in GcpServiceAccountCredentials (which extends GcpCredentials)
+    wrapper_creds = GcpServiceAccountCredentials()
+    wrapper_creds.project_id = "test-project"
+    wrapper_creds._set_default_credentials(native_credentials)
+    wrapper_creds.__is_resolved__ = True
+
+    # Test that configuration accepts wrapped credentials
+    config = BigQueryClientConfiguration(credentials=wrapper_creds)._bind_dataset_name(
+        dataset_name="test_dataset"
+    )
+
+    assert config.credentials == wrapper_creds
+    assert config.credentials.project_id == "test-project"
+    assert config.credentials.has_default_credentials()
+
+
+@pytest.mark.parametrize(
+    "error_reason,message,expected_exception",
+    [
+        ("internalError", "Internal error occurred", DatabaseTransientException),
+        ("backendError", "Backend error", DatabaseTransientException),
+        ("rateLimitExceeded", "Rate limit exceeded", DatabaseTransientException),
+        ("invalidQuery", "Invalid query", DatabaseTransientException),
+        ("notFound", "Table not found", DatabaseTerminalException),
+        ("invalid", "Invalid request", DatabaseTerminalException),
+    ],
+)
+def test_error_raises_appropriate_exception(
+    error_reason: str, message: str, expected_exception: Type[Exception]
+) -> None:
+    """Test that different BigQuery error reasons raise the appropriate exception type."""
+    job = BigQueryLoadJob(
+        file_path=TEST_FILE_PATH,
+        http_timeout=15.0,
+        retry_deadline=60.0,
+    )
+
+    error_result = {"reason": error_reason, "message": message}
+    mock_bq_job = MagicMock()
+    mock_bq_job.done.return_value = True
+    mock_bq_job.output_rows = None
+    mock_bq_job.error_result = error_result
+
+    job._bq_load_job = mock_bq_job
+    mock_client = MagicMock()
+    mock_client._create_load_job.return_value = mock_bq_job
+    job._job_client = mock_client
+    job._load_table = {"name": "test_table"}
+
+    with pytest.raises(expected_exception) as exc_info:
+        job.run()
+    exception_str = str(exc_info.value)
+    assert error_reason in exception_str
+    # transient exceptions include error details in the message
+    if expected_exception is DatabaseTransientException:
+        assert "Error details:" in exception_str
+
+
+def test_internal_error_does_not_loop() -> None:
+    """Regression: internalError must raise, not loop forever polling a done job."""
+    job = BigQueryLoadJob(
+        file_path=TEST_FILE_PATH,
+        http_timeout=15.0,
+        retry_deadline=60.0,
+    )
+
+    mock_bq_job = MagicMock()
+    # done() returns True every time — job is finished on BQ side
+    mock_bq_job.done.return_value = True
+    mock_bq_job.output_rows = None
+    mock_bq_job.error_result = {"reason": "internalError", "message": "transient"}
+
+    job._bq_load_job = mock_bq_job
+    mock_client = MagicMock()
+    mock_client._create_load_job.return_value = mock_bq_job
+    job._job_client = mock_client
+    job._load_table = {"name": "test_table"}
+
+    with pytest.raises(DatabaseTransientException):
+        job.run()
+    # done() should be called exactly once — no infinite polling
+    assert mock_bq_job.done.call_count == 1

@@ -17,11 +17,13 @@ import lancedb.table
 import pyarrow as pa
 from lancedb.embeddings import EmbeddingFunctionRegistry, TextEmbeddingFunction
 from lancedb.query import LanceQueryBuilder
+from packaging.version import Version
 from pyarrow import Array, ChunkedArray
 
 from dlt.common import json, pendulum, logger
 from dlt.common.libs.numpy import numpy
 from dlt.common.destination import DestinationCapabilitiesContext
+from dlt.common.destination.utils import resolve_merge_strategy
 from dlt.common.destination.exceptions import (
     DestinationUndefinedEntity,
     DestinationTerminalException,
@@ -72,6 +74,7 @@ from dlt.destinations.impl.lancedb.utils import (
 from dlt.destinations.job_impl import ReferenceFollowupJobRequest
 from dlt.destinations.sql_jobs import SqlMergeFollowupJob
 from dlt.destinations.type_mapping import TypeMapperImpl
+from dlt.destinations.sql_client import SqlClientBase, WithSqlClient
 
 if TYPE_CHECKING:
     NDArray = numpy.ndarray[Any, Any]
@@ -79,7 +82,7 @@ else:
     NDArray = numpy.ndarray
 
 
-class LanceDBClient(JobClientBase, WithStateSync):
+class LanceDBClient(JobClientBase, WithStateSync, WithSqlClient):
     """LanceDB destination handler."""
 
     model_func: TextEmbeddingFunction
@@ -99,6 +102,7 @@ class LanceDBClient(JobClientBase, WithStateSync):
         self.type_mapper = self.capabilities.get_type_mapper()
         self.sentinel_table_name = config.sentinel_table_name
         self.dataset_name = self.config.normalize_dataset_name(self.schema)
+        self._sql_client: SqlClientBase[Any] = None
 
         embedding_model_provider = self.config.embedding_model_provider
         embedding_model_host = self.config.embedding_model_provider_host
@@ -117,6 +121,25 @@ class LanceDBClient(JobClientBase, WithStateSync):
             # actually the model func doesnt need the api-key!
             **({"host": embedding_model_host} if embedding_model_host else {}),
         )
+
+    @property
+    def sql_client_class(self) -> Type[SqlClientBase[Any]]:
+        from dlt.destinations.impl.lancedb.sql_client import LanceDBSQLClient
+
+        return LanceDBSQLClient
+
+    @property
+    def sql_client(self) -> SqlClientBase[Any]:
+        # inner import because `LanceDBSQLClient` depends on `duckdb` and is optional
+        from dlt.destinations.impl.lancedb.sql_client import LanceDBSQLClient
+
+        if not self._sql_client:
+            self._sql_client = LanceDBSQLClient(self)
+        return self._sql_client
+
+    @sql_client.setter
+    def sql_client(self, client: SqlClientBase[Any]) -> None:
+        self._sql_client = client
 
     @property
     def sentinel_table(self) -> str:
@@ -153,6 +176,19 @@ class LanceDBClient(JobClientBase, WithStateSync):
         """
         return self.db_client.create_table(table_name, schema=schema, mode=mode)
 
+    def drop_tables(self, *tables: str, delete_schema: bool = True) -> None:
+        """Drop multiple LanceDB tables.
+
+        Args:
+            table_names: The names of the tables to drop.
+        """
+        if not tables:
+            return
+
+        for table_name in tables:
+            if table_name in self.list_table_names():
+                self.db_client.drop_table(table_name)
+
     def delete_table(self, table_name: str) -> None:
         """Delete a LanceDB table.
 
@@ -179,6 +215,11 @@ class LanceDBClient(JobClientBase, WithStateSync):
         query_table.checkout_latest()
         return query_table.search(query=query)
 
+    def list_table_names(self) -> List[str]:
+        if Version(lancedb.__version__) >= Version("0.26.0"):
+            return list(self.db_client.list_tables().tables)
+        return list(self.db_client.table_names())
+
     @lancedb_error
     def _get_table_names(self) -> List[str]:
         """Return all tables in the dataset, excluding the sentinel table."""
@@ -186,11 +227,11 @@ class LanceDBClient(JobClientBase, WithStateSync):
             prefix = f"{self.dataset_name}{self.config.dataset_separator}"
             table_names = [
                 table_name
-                for table_name in self.db_client.table_names()
+                for table_name in self.list_table_names()
                 if table_name.startswith(prefix)
             ]
         else:
-            table_names = self.db_client.table_names()
+            table_names = self.list_table_names()
 
         return [table_name for table_name in table_names if table_name != self.sentinel_table]
 
@@ -319,6 +360,14 @@ class LanceDBClient(JobClientBase, WithStateSync):
                 **self.type_mapper.from_destination_type(field.type, None, None),
             }
         return True, table_schema
+
+    def get_storage_tables(
+        self, table_names: Iterable[str]
+    ) -> Iterable[Tuple[bool, TTableSchemaColumns]]:
+        for table_name in table_names:
+            # mypy fails to resolve table_schema; ty succeeds
+            table_exists, table_schema = self.get_storage_table(table_name)
+            yield table_name, table_schema  # type: ignore[misc]
 
     @lancedb_error
     def extend_lancedb_table_schema(self, table_name: str, field_schemas: List[pa.Field]) -> None:
@@ -502,6 +551,8 @@ class LanceDBClient(JobClientBase, WithStateSync):
     def get_stored_schema(self, schema_name: str = None) -> Optional[StorageSchemaInfo]:
         """Retrieves newest schema from destination storage."""
         fq_version_table_name = self.make_qualified_table_name(self.schema.version_table_name)
+        if fq_version_table_name not in self.list_table_names():
+            return None
 
         version_table: "lancedb.table.Table" = self.db_client.open_table(fq_version_table_name)
         version_table.checkout_latest()
@@ -582,11 +633,16 @@ class LanceDBClient(JobClientBase, WithStateSync):
         jobs = super().create_table_chain_completed_followup_jobs(
             table_chain, completed_table_chain_jobs  # type: ignore[arg-type]
         )
-        # Orphan removal is only supported for upsert strategy because we need a deterministic key hash.
+        # orphan removal replaces old versions of docs, skip for insert-only
         first_table_in_chain = table_chain[0]
-        if first_table_in_chain.get(
-            "write_disposition"
-        ) == "merge" and not first_table_in_chain.get(NO_REMOVE_ORPHANS_HINT):
+        merge_strategy = resolve_merge_strategy(
+            {first_table_in_chain["name"]: first_table_in_chain}, first_table_in_chain
+        )
+        if (
+            first_table_in_chain.get("write_disposition") == "merge"
+            and merge_strategy != "insert-only"
+            and not first_table_in_chain.get(NO_REMOVE_ORPHANS_HINT)
+        ):
             all_job_paths_ordered = [
                 job.file_path
                 for table in table_chain
@@ -600,4 +656,4 @@ class LanceDBClient(JobClientBase, WithStateSync):
         return jobs
 
     def table_exists(self, table_name: str) -> bool:
-        return table_name in self.db_client.table_names()
+        return table_name in self.list_table_names()

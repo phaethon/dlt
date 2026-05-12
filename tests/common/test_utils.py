@@ -110,7 +110,8 @@ def test_get_module_name() -> None:
 
     # use exec to get __main__ exception
     mod_name = Venv.restore_current().run_script("tests/common/cases/modules/uniq_mod_121.py")
-    assert mod_name.strip() == "uniq_mod_121"
+    # take last non-empty line: dep warnings may appear on stderr (merged into stdout)
+    assert mod_name.strip().splitlines()[-1] == "uniq_mod_121"
 
 
 def test_concat_strings_with_limit() -> None:
@@ -257,6 +258,23 @@ def test_extend_list_deduplicated() -> None:
         "three",
     ]
     assert extend_list_deduplicated([], ["one", "two", "three"]) == ["one", "two", "three"]
+
+    # duplicates within extending_list
+    assert extend_list_deduplicated(["one"], ["two", "two", "three"]) == [
+        "one",
+        "two",
+        "three",
+    ]
+    # duplicates within extending_list on empty original
+    assert extend_list_deduplicated([], ["one", "one", "two", "two"]) == ["one", "two"]
+
+    # case-insensitive dedup via normalize_f
+    assert extend_list_deduplicated(["One"], ["two", "TWO"], str.lower) == [
+        "One",
+        "two",
+    ]
+    # normalize_f dedup against original
+    assert extend_list_deduplicated(["One"], ["one"], str.lower) == ["One"]
 
 
 def test_exception_traces() -> None:

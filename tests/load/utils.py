@@ -8,6 +8,7 @@ from typing import (
     Iterator,
     List,
     Sequence,
+    Set,
     IO,
     Tuple,
     Optional,
@@ -17,6 +18,7 @@ from typing import (
     cast,
 )
 import shutil
+from copy import deepcopy
 from pathlib import Path
 from urllib.parse import urlparse
 from dataclasses import dataclass
@@ -46,12 +48,14 @@ from dlt.common.destination import TLoaderFileFormat, Destination, TDestinationR
 from dlt.common.destination.exceptions import DestinationUndefinedEntity, SqlClientNotAvailable
 from dlt.common.data_writers import DataWriter
 from dlt.common.exceptions import MissingDependencyException
+from dlt.common.normalizers.typing import TNamingConventionReferenceArg
 from dlt.common.pipeline import PipelineContext
 from dlt.common.schema import TTableSchemaColumns, Schema
 from dlt.common.schema.typing import TTableFormat, TTableSchema
 from dlt.common.storages import SchemaStorage, FileStorage, SchemaStorageConfiguration
 from dlt.common.schema.utils import new_table, normalize_table_identifiers
 from dlt.common.storages import ParsedLoadJobFileName, LoadStorage, PackageStorage
+from dlt.common.storages.configuration import FilesystemConfiguration
 from dlt.common.storages.load_package import LoadJobInfo, create_load_id
 from dlt.common.typing import StrAny
 from dlt.common.utils import uniq_id
@@ -61,12 +65,15 @@ from dlt.destinations.impl.filesystem.configuration import FilesystemDestination
 from dlt.destinations.sql_client import SqlClientBase
 from dlt.destinations.job_client_impl import SqlJobClientBase
 
+from tests.load.lance_utils import LanceRestServerConfig, get_lance_namespace_name
 from tests.utils import (
     ACTIVE_DESTINATIONS,
     ACTIVE_TABLE_FORMATS,
     IMPLEMENTED_DESTINATIONS,
     SQL_DESTINATIONS,
     EXCLUDED_DESTINATION_CONFIGURATIONS,
+    EXCLUDED_DESTINATION_TEST_CONFIGURATION_IDS,
+    get_test_worker_id,
 )
 from tests.cases import (
     TABLE_UPDATE_COLUMNS_SCHEMA,
@@ -81,12 +88,18 @@ AWS_BUCKET = dlt.config.get("tests.bucket_url_s3", str)
 GCS_BUCKET = dlt.config.get("tests.bucket_url_gs", str)
 AZ_BUCKET = dlt.config.get("tests.bucket_url_az", str)
 ABFS_BUCKET = dlt.config.get("tests.bucket_url_abfss", str)
+ONELAKE_BUCKET = dlt.config.get("tests.bucket_url_onelake", str)
 GDRIVE_BUCKET = dlt.config.get("tests.bucket_url_gdrive", str)
 FILE_BUCKET = dlt.config.get("tests.bucket_url_file", str)
 R2_BUCKET = dlt.config.get("tests.bucket_url_r2", str)
 SFTP_BUCKET = dlt.config.get("tests.bucket_url_sftp", str)
 HTTP_BUCKET = dlt.config.get("tests.bucket_url_http", str)
 MEMORY_BUCKET = dlt.config.get("tests.memory", str)
+HF_BUCKET = dlt.config.get("tests.bucket_url_hf", str)
+
+# S3 tables
+S3_TABLE_BUCKET_ARN = dlt.config.get("tests.s3_table_bucket_arn", str)
+S3_TABLES_CATALOG = dlt.config.get("tests.s3_tables_catalog", str)
 
 ALL_FILESYSTEM_DRIVERS = dlt.config.get("ALL_FILESYSTEM_DRIVERS", list) or [
     "s3",
@@ -99,6 +112,7 @@ ALL_FILESYSTEM_DRIVERS = dlt.config.get("ALL_FILESYSTEM_DRIVERS", list) or [
     "https",
     "r2",
     "sftp",
+    "hf",
 ]
 
 # Filter out buckets not in all filesystem drivers
@@ -111,6 +125,7 @@ WITH_GDRIVE_BUCKETS = [
     AZ_BUCKET,
     GDRIVE_BUCKET,
     SFTP_BUCKET,
+    HF_BUCKET,
 ]
 WITH_GDRIVE_BUCKETS = [
     bucket
@@ -121,6 +136,14 @@ WITH_GDRIVE_BUCKETS = [
 # temporary solution to include gdrive bucket in tests,
 # while gdrive is not working as a destination
 DEFAULT_BUCKETS = [bucket for bucket in WITH_GDRIVE_BUCKETS if bucket != GDRIVE_BUCKET]
+
+# NOTE: we can't include MEMORY_BUCKET here — unlike fsspec, `object_store`'s memory impl does
+# not use a global singleton storage as required by dlt
+OBJECT_STORE_RS_BUCKETS = [
+    bucket
+    for bucket in (FILE_BUCKET, AWS_BUCKET, GCS_BUCKET, AZ_BUCKET)
+    if FilesystemDestinationClientConfiguration.parse_protocol(bucket) in ALL_FILESYSTEM_DRIVERS
+]
 
 # Add r2 in extra buckets so it's not run for all tests
 R2_BUCKET_CONFIG = dict(
@@ -160,6 +183,7 @@ class DestinationTestConfiguration:
     """Class for defining test setup for one destination."""
 
     destination_type: str
+    cid: Optional[str] = None  # configuration id
     staging: Optional[TDestinationReferenceArg] = None
     file_format: Optional[TLoaderFileFormat] = None
     table_format: Optional[TTableFormat] = None
@@ -170,12 +194,14 @@ class DestinationTestConfiguration:
     extra_info: Optional[str] = None
     supports_merge: bool = True  # TODO: take it from client base class
     force_iceberg: bool = None  # used only to test deprecation
+    aws_data_catalog: Optional[str] = None
     supports_dbt: bool = True
     disable_compression: bool = None  # use default value
     dev_mode: bool = False
     credentials: Optional[Union[CredentialsConfiguration, Dict[str, Any], str]] = None
     env_vars: Optional[Dict[str, str]] = None
     destination_name: Optional[str] = None
+    naming_convention: Optional[TNamingConventionReferenceArg] = None
 
     def destination_factory(self, **kwargs) -> Destination[Any, Any]:
         dest_type = kwargs.pop("destination", self.destination_type)
@@ -200,6 +226,8 @@ class DestinationTestConfiguration:
             name += "-no-staging"
         else:
             name += "-staging"
+        if self.naming_convention:
+            name += f"-{str(self.naming_convention)}"
         if self.extra_info:
             name += f"-{self.extra_info}"
         return name
@@ -214,6 +242,8 @@ class DestinationTestConfiguration:
                 "staging_iam_role",
                 "staging_use_msi",
                 "force_iceberg",
+                "aws_data_catalog",
+                "naming_convention",
             ]
             if getattr(self, k, None) is not None
         }
@@ -224,7 +254,10 @@ class DestinationTestConfiguration:
             "DESTINATION"
         )
         for k, v in self.factory_kwargs.items():
-            os.environ[f"{env_key_prefix}__{k.upper()}"] = str(v)
+            if k == "naming_convention":
+                os.environ["SCHEMA__NAMING"] = str(v)
+            else:
+                os.environ[f"{env_key_prefix}__{k.upper()}"] = str(v)
 
         # For the filesystem destinations we disable compression to make analyzing the result easier
         os.environ["DATA_WRITER__DISABLE_COMPRESSION"] = str(
@@ -284,6 +317,17 @@ class DestinationTestConfiguration:
         """Returns a dict of kwargs to be passed to pipeline.run method: currently file and table format"""
         return dict(loader_file_format=self.file_format, table_format=self.table_format)
 
+    @property
+    def is_athena_s3_tables(self) -> bool:
+        return self.destination_type == "athena" and self.aws_data_catalog == S3_TABLES_CATALOG
+
+    @property
+    def uses_table_format_for_state_table(self) -> bool:
+        """Whether destination uses table format (Iceberg, Delta, ...) for pipeline state table."""
+        if self.is_athena_s3_tables:
+            return True
+        return False
+
 
 def destinations_configs(
     default_sql_configs: bool = False,
@@ -294,6 +338,7 @@ def destinations_configs(
     all_buckets_filesystem_configs: bool = False,
     table_format_filesystem_configs: bool = False,
     table_format_local_configs: bool = False,
+    read_only_sqlclient_configs: bool = False,
     subset: Sequence[str] = (),
     bucket_subset: Sequence[str] = (),
     exclude: Sequence[str] = (),
@@ -302,8 +347,80 @@ def destinations_configs(
     with_table_format: Union[TTableFormat, Sequence[TTableFormat]] = None,
     supports_merge: Optional[bool] = None,
     supports_dbt: Optional[bool] = None,
+    supports_file_format: Optional[TLoaderFileFormat] = None,
+    **attr_subset: Any,  # generic attribute filter; useful if above params are not specific enough
 ) -> List[DestinationTestConfiguration]:
+    """Generate a filtered list of destination test configurations for parametrized tests.
+
+    Builds a list of DestinationTestConfiguration candidates based on config selection flags,
+    then filters it by active destinations and additional filter parameters.
+
+    Config Selection (candidates are built by combining these):
+        default_sql_configs: Include one config per SQL destination (duckdb, postgres,
+            bigquery, snowflake, redshift, athena, mssql, synapse, databricks, clickhouse,
+            dremio, sqlalchemy, motherduck, ducklake, fabric).
+        default_vector_configs: Include vector database configs (weaviate, lancedb, qdrant).
+        default_staging_configs: Include common staging configs (redshift/s3, bigquery/gcs,
+            snowflake with various buckets, databricks, synapse, fabric, clickhouse).
+        all_staging_configs: Include all staging configs (superset of default_staging_configs).
+        local_filesystem_configs: Include local filesystem configs with parquet and jsonl.
+        all_buckets_filesystem_configs: Include filesystem configs for all default buckets
+            (s3, gcs, az, abfss, file, memory, sftp).
+        table_format_filesystem_configs: Include delta and iceberg table format configs
+            for all buckets (except sftp, memory, hf; az excluded for both delta and iceberg).
+        table_format_local_configs: Include delta and iceberg configs for local file bucket only.
+        read_only_sqlclient_configs: Include all configs that support read-only SQL client
+            (filesystem with all buckets, table formats, and lancedb).
+
+    Active Destination Filtering:
+        The candidate list is first filtered to include only destinations in ACTIVE_DESTINATIONS
+        (configurable via `ACTIVE_DESTINATIONS` config key, defaults to all IMPLEMENTED_DESTINATIONS).
+        Similarly, configs are filtered by ACTIVE_TABLE_FORMATS.
+
+    Additional Filters (applied after active destination filtering):
+        subset: Keep only configs where destination_type is in this sequence.
+        bucket_subset: Keep only filesystem configs (or all if subset specified) where
+            bucket_url is in this sequence.
+        exclude: Remove configs where destination_type, destination_name, or config name
+            matches any value in this sequence.
+        bucket_exclude: Remove filesystem configs where bucket_url matches any value.
+        with_file_format: Keep only configs with file_format matching this value(s).
+        with_table_format: Keep only configs with table_format matching this value(s).
+        supports_merge: Keep only configs where supports_merge equals this value.
+        supports_dbt: Keep only configs where supports_dbt equals this value.
+        supports_file_format: Keep only configs whose destination capabilities include
+            this format in supported_loader_file_formats or supported_staging_file_formats.
+        **attr_subset: Generic filter - keep configs where the named attribute matches
+            any of the provided values.
+
+    Global Exclusions:
+        Configs are also filtered out if their name is in EXCLUDED_DESTINATION_CONFIGURATIONS
+        or their cid is in EXCLUDED_DESTINATION_TEST_CONFIGURATION_IDS (both configurable).
+
+    Returns:
+        List of DestinationTestConfiguration objects matching all criteria.
+
+    Examples:
+        # All SQL destinations (one config each)
+        >>> destinations_configs(default_sql_configs=True)
+
+        # Only postgres and snowflake
+        >>> destinations_configs(default_sql_configs=True, subset=["postgres", "snowflake"])
+
+        # SQL configs that support merge operations
+        >>> destinations_configs(default_sql_configs=True, supports_merge=True)
+
+        # Filesystem with delta table format
+        >>> destinations_configs(table_format_filesystem_configs=True, with_table_format="delta")
+
+        # SQL configs excluding sqlalchemy
+        >>> destinations_configs(default_sql_configs=True, exclude=["sqlalchemy"])
+
+        # Staging configs for specific bucket
+        >>> destinations_configs(default_staging_configs=True, bucket_subset=[AWS_BUCKET])
+    """
     input_args = locals()
+    worker = get_test_worker_id()
 
     # import filesystem destination to use named version for minio
     from dlt.destinations import filesystem
@@ -316,34 +433,93 @@ def destinations_configs(
         # Athena needs filesystem staging, which will be automatically set; we have to supply a bucket url though.
         DestinationTestConfiguration(
             destination_type="athena",
+            cid="athena",
             file_format="parquet",
             supports_merge=False,
             bucket_url=AWS_BUCKET,
         ),
         DestinationTestConfiguration(
             destination_type="athena",
+            cid="athena-iceberg",
             file_format="parquet",
             bucket_url=AWS_BUCKET,
             supports_merge=True,
             supports_dbt=False,
             table_format="iceberg",
-            extra_info="iceberg",
         ),
+        DestinationTestConfiguration(
+            destination_type="athena",
+            cid="athena-s3-tables",
+            file_format="parquet",
+            bucket_url=AWS_BUCKET,
+            supports_merge=True,
+            supports_dbt=False,
+            aws_data_catalog=S3_TABLES_CATALOG,
+            table_format="iceberg",
+            naming_convention="s3_tables",
+        ),
+    ]
+
+    lance_configs = [
+        # directory namespace configs
+        *[
+            DestinationTestConfiguration(
+                destination_type="lance",
+                extra_info=f"dir-{FilesystemConfiguration.parse_protocol(bucket)}",
+                env_vars={
+                    "DESTINATION__STORAGE__BUCKET_URL": bucket,
+                    "DESTINATION__STORAGE__NAMESPACE_NAME": get_lance_namespace_name(),
+                },
+            )
+            for bucket in OBJECT_STORE_RS_BUCKETS
+        ],
+        # REST namespace configs
+        # NOTE: we exclude cloud storage-backed REST namespaces here because `RestAdapter` (which
+        # we use as test REST Namespace server) does not vend credentials — we only include a
+        # local storage-backed REST namespace, which does not need credentials
+        *[
+            DestinationTestConfiguration(
+                destination_type="lance",
+                extra_info=f"rest-{FilesystemConfiguration.parse_protocol(bucket)}",
+                env_vars=LanceRestServerConfig.get_destination_test_configuration_env_vars(),
+            )
+            for bucket in OBJECT_STORE_RS_BUCKETS
+            if bucket == FILE_BUCKET
+        ],
     ]
 
     # default non staging sql based configs, one per destination
     if default_sql_configs:
         destination_configs += [
             DestinationTestConfiguration(destination_type=destination)
-            for destination in SQL_DESTINATIONS
+            for destination in sorted(SQL_DESTINATIONS)
             if destination
-            not in ("athena", "synapse", "dremio", "clickhouse", "sqlalchemy", "ducklake")
+            not in (
+                "athena",
+                "synapse",
+                "dremio",
+                "clickhouse",
+                "sqlalchemy",
+                "ducklake",
+                "fabric",
+                "motherduck",
+            )
         ]
         destination_configs += [
             DestinationTestConfiguration(destination_type="duckdb", file_format="parquet"),
-            DestinationTestConfiguration(destination_type="ducklake", supports_dbt=False),
             DestinationTestConfiguration(
-                destination_type="motherduck", file_format="insert_values"
+                destination_type="ducklake",
+                supports_dbt=False,
+                credentials={"ducklake_name": f"ducklake_{worker}"},
+            ),
+            DestinationTestConfiguration(
+                destination_type="motherduck",
+                credentials={"database": f"dlt_test_{worker}"},
+            ),
+            DestinationTestConfiguration(
+                destination_type="motherduck",
+                file_format="insert_values",
+                credentials={"database": f"dlt_test_{worker}"},
             ),
         ]
 
@@ -365,7 +541,7 @@ def destinations_configs(
                 supports_merge=True,
                 supports_dbt=False,
                 destination_name="sqlalchemy_sqlite",
-                credentials="sqlite:///_storage/dl_data.sqlite",
+                credentials="sqlite:///db.sqlite",
             ),
             # TODO: enable in sql alchemy destination test, 99% of tests work
             # DestinationTestConfiguration(
@@ -408,6 +584,7 @@ def destinations_configs(
         destination_configs += [
             # DestinationTestConfiguration(destination_type="mssql", supports_dbt=False),
             DestinationTestConfiguration(destination_type="synapse", supports_dbt=False),
+            DestinationTestConfiguration(destination_type="fabric", supports_dbt=True),
         ]
 
         # sanity check that when selecting default destinations, one of each sql destination is actually
@@ -418,9 +595,11 @@ def destinations_configs(
         destination_configs += [
             DestinationTestConfiguration(destination_type="weaviate"),
             DestinationTestConfiguration(destination_type="lancedb"),
+        ]
+        destination_configs += [
             DestinationTestConfiguration(
                 destination_type="qdrant",
-                credentials=dict(path=str(Path(FILE_BUCKET) / "qdrant_data")),
+                credentials=dict(path="qdrant_data"),
                 extra_info="local-file",
             ),
             DestinationTestConfiguration(
@@ -429,6 +608,7 @@ def destinations_configs(
                 extra_info="server",
             ),
         ]
+        destination_configs += lance_configs
 
     if (default_sql_configs or all_staging_configs) and not default_sql_configs:
         # athena default configs not added yet
@@ -523,6 +703,22 @@ def destinations_configs(
                 file_format="parquet",
                 bucket_url=AZ_BUCKET,
                 extra_info="az-authorization",
+                disable_compression=True,
+            ),
+            DestinationTestConfiguration(
+                destination_type="fabric",
+                staging="filesystem",
+                file_format="parquet",
+                bucket_url=AZ_BUCKET,
+                extra_info="az-authorization",
+                disable_compression=True,
+            ),
+            DestinationTestConfiguration(
+                destination_type="fabric",
+                staging=filesystem(destination_name="onelake"),
+                file_format="parquet",
+                bucket_url=ONELAKE_BUCKET,
+                extra_info="onelake-service-principal",
                 disable_compression=True,
             ),
             DestinationTestConfiguration(
@@ -622,8 +818,9 @@ def destinations_configs(
             )
         ]
 
-    if all_buckets_filesystem_configs:
-        for bucket in DEFAULT_BUCKETS:
+    # all filesystem configs also implement read-only sql client
+    if all_buckets_filesystem_configs or read_only_sqlclient_configs:
+        for bucket in set(DEFAULT_BUCKETS) - {HF_BUCKET}:
             destination_configs += [
                 DestinationTestConfiguration(
                     destination_type="filesystem",
@@ -633,15 +830,30 @@ def destinations_configs(
                     file_format="jsonl",  # keep jsonl as default, test utils are setup for this
                 )
             ]
+        if "hf" in ALL_FILESYSTEM_DRIVERS:
+            destination_configs += [
+                DestinationTestConfiguration(
+                    destination_type="filesystem",
+                    bucket_url=HF_BUCKET,
+                    extra_info=HF_BUCKET,
+                    supports_merge=False,
+                    file_format="parquet",
+                    # increase timeout to avoid flakes (default is 10s)
+                    env_vars={"HF_HUB_DOWNLOAD_TIMEOUT": "30"},
+                )
+            ]
 
-    if table_format_filesystem_configs or table_format_local_configs:
+    # table format configs also implement read-only sqlclient configs
+    if table_format_filesystem_configs or table_format_local_configs or read_only_sqlclient_configs:
         if table_format_filesystem_configs:
-            table_buckets = set(DEFAULT_BUCKETS) - {SFTP_BUCKET, MEMORY_BUCKET}
+            table_buckets = set(DEFAULT_BUCKETS) - {SFTP_BUCKET, MEMORY_BUCKET, HF_BUCKET}
         else:
             table_buckets = {FILE_BUCKET}
 
-        # NOTE: delta does not work on memory buckets
-        for bucket in table_buckets:
+        # NOTE: delta-rs kernel fails on az:// scheme (empty log segment error),
+        # Azure is tested via abfss://
+        delta_buckets = table_buckets - {AZ_BUCKET}
+        for bucket in delta_buckets:
             destination_configs += [
                 DestinationTestConfiguration(
                     destination_type="filesystem",
@@ -669,9 +881,9 @@ def destinations_configs(
                     destination_name="filesystem_s3_gcs_comp" if bucket == GCS_BUCKET else None,
                 )
             ]
-            if bucket in [AZ_BUCKET]:
-                # `pyiceberg` does not support `az` scheme
-                continue
+        # pyiceberg does not support az:// scheme
+        iceberg_buckets = table_buckets - {AZ_BUCKET}
+        for bucket in iceberg_buckets:
             destination_configs += [
                 DestinationTestConfiguration(
                     destination_type="filesystem",
@@ -683,6 +895,14 @@ def destinations_configs(
                     destination_name="fsgcpoauth" if bucket == GCS_BUCKET else None,
                 )
             ]
+
+    # all remaining destinations that implement read-only sqlclient, typically on top of non sql
+    # destination
+    if read_only_sqlclient_configs:
+        destination_configs += [
+            DestinationTestConfiguration(destination_type="lancedb"),
+        ]
+        destination_configs += lance_configs
 
     try:
         # register additional destinations from _addons.py which must be placed in the same folder
@@ -755,13 +975,65 @@ def destinations_configs(
         destination_configs = [
             conf for conf in destination_configs if conf.supports_dbt == supports_dbt
         ]
+    if supports_file_format is not None:
+        _fmt_cache: Dict[str, Set[str]] = {}
+
+        def _dest_has_format(conf: DestinationTestConfiguration) -> bool:
+            dt = conf.destination_type
+            if dt not in _fmt_cache:
+                caps = conf.raw_capabilities()
+                _fmt_cache[dt] = set(caps.supported_loader_file_formats or []) | set(
+                    caps.supported_staging_file_formats or []
+                )
+            return supports_file_format in _fmt_cache[dt]
+
+        destination_configs = [conf for conf in destination_configs if _dest_has_format(conf)]
+
+    # filter by other attributes
+    for attr_name, allowed_values in attr_subset.items():
+        if isinstance(allowed_values, str) or not isinstance(allowed_values, Sequence):
+            allowed_values = [allowed_values]
+        destination_configs = [
+            conf for conf in destination_configs if getattr(conf, attr_name) in allowed_values
+        ]
 
     # filter out excluded configs
     destination_configs = [
         conf for conf in destination_configs if conf.name not in EXCLUDED_DESTINATION_CONFIGURATIONS
     ]
 
+    # filter out excluded ids
+    destination_configs = [
+        conf
+        for conf in destination_configs
+        if conf.cid not in EXCLUDED_DESTINATION_TEST_CONFIGURATION_IDS
+    ]
+
     return destination_configs
+
+
+def with_naming_convention(
+    destination_config: DestinationTestConfiguration,
+    naming_convention: TNamingConventionReferenceArg,
+) -> DestinationTestConfiguration:
+    destination_config_ = deepcopy(destination_config)
+    destination_config_.naming_convention = naming_convention
+    return destination_config_
+
+
+def destinations_configs_with_naming_convention(
+    naming_conventions: Sequence[TNamingConventionReferenceArg], **destinations_configs_kwargs: Any
+) -> List[DestinationTestConfiguration]:
+    confs = destinations_configs(**destinations_configs_kwargs)
+
+    confs_without_naming = [c for c in confs if c.naming_convention is None]
+    confs_with_naming = [c for c in confs if c.naming_convention is not None]
+
+    confs_with_naming_injected = [
+        with_naming_convention(c, n) for c in confs_without_naming for n in naming_conventions
+    ]
+
+    return confs_with_naming_injected + confs_with_naming
 
 
 @pytest.fixture(autouse=True)
@@ -1028,19 +1300,21 @@ def yield_client_with_storage(
 
     with cm_yield_client(destination, dataset_name, default_config_values, schema_name) as client:
         client.initialize_storage()
-        yield client
-        if client.is_storage_initialized():
-            try:
-                client.drop_storage()
-            except Exception as exc:
-                print(f"drop dataset {dataset_name}: {exc}")
-        if isinstance(client, WithStagingDataset):
-            with client.with_staging_dataset():
-                if client.is_storage_initialized():
-                    try:
-                        client.drop_storage()
-                    except Exception as exc:
-                        print(f"drop dataset {dataset_name} STAGING: {exc}")
+        try:
+            yield client
+        finally:
+            if client.is_storage_initialized():
+                try:
+                    client.drop_storage()
+                except Exception as exc:
+                    print(f"drop dataset {dataset_name}: {exc}")
+            if isinstance(client, WithStagingDataset):
+                with client.with_staging_dataset():
+                    if client.is_storage_initialized():
+                        try:
+                            client.drop_storage()
+                        except Exception as exc:
+                            print(f"drop dataset {dataset_name} STAGING: {exc}")
 
 
 def delete_dataset(client: SqlClientBase[Any], normalized_dataset_name: str) -> None:
@@ -1058,6 +1332,21 @@ def cm_yield_client_with_storage(
     schema_name: str = "event",
 ) -> Iterator[SqlJobClientBase]:
     return yield_client_with_storage(destination, default_config_values, schema_name)
+
+
+class SqlJobClientBaseWithDestinationTestConfiguration(SqlJobClientBase):
+    destination_config: DestinationTestConfiguration
+
+
+@pytest.fixture(scope="function")
+def sql_job_client_from_destination_config(
+    request,
+) -> Iterator[SqlJobClientBaseWithDestinationTestConfiguration]:
+    param: DestinationTestConfiguration = request.param
+    for client in yield_client_with_storage(param.destination_factory()):
+        client = cast(SqlJobClientBaseWithDestinationTestConfiguration, client)
+        client.destination_config = param
+        yield client
 
 
 def write_dataset(
@@ -1196,10 +1485,10 @@ def table_update_and_row_for_destination(destination_config: DestinationTestConf
         exclude_types.append("time")
 
     if (
-        destination_config.destination_type == "synapse"
+        destination_config.destination_type in ("synapse", "fabric")
         and destination_config.file_format == "parquet"
     ):
-        # TIME columns are not supported for staged parquet loads into Synapse
+        # TIME columns are not supported for staged parquet loads into Synapse/Fabric
         exclude_types.append("time")
 
     if destination_config.destination_type in (

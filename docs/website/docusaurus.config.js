@@ -115,6 +115,27 @@ const config = {
     ],
   ],
 
+  plugins: [
+    [
+      require.resolve('./plugins/llms-txt'),
+      {
+        siteTitle: 'dlt - data load tool',
+        siteDescription: 'dlt is an open-source Python library that loads data from various sources into well-structured datasets. Built for LLMs with 8000+ source connectors.',
+        excludeFromMd: ['api_reference/'],
+        excludeFromIndex: ['devel/'],
+        groupDepth: 2,
+        separateIndexes: [
+          {
+            prefix: 'hub/',
+            title: 'dltHub',
+            description: 'dltHub is a managed platform for dlt pipelines with a web UI, pipeline runner, and collaboration features.',
+            sidebar: 'hubSidebar',
+          },
+        ],
+      },
+    ],
+  ],
+
   themeConfig:
     /** @type {import('@docusaurus/preset-classic').ThemeConfig} */
     ({
@@ -129,16 +150,33 @@ const config = {
           {
             type: 'docsVersionDropdown',
           },
-          { to: 'https://dlthub.com/blog', label: 'Blog', position: 'left' },
+          {
+            type: 'docSidebar',
+            sidebarId: 'docsSidebar',
+            position: 'left',
+            label: 'dlt',
+          },
+          {
+            type: 'docSidebar',
+            sidebarId: 'cookbookSidebar',
+            position: 'left',
+            label: 'Cookbook',
+          },
+          {
+            type: 'docSidebar',
+            sidebarId: 'educationSidebar',
+            position: 'left',
+            label: 'Education',
+          },
+          { to: '/release-highlights', label: "What's new?", position: 'left' },
+          { to: 'https://dlthub.com/blog', label: 'Blog', position: 'right' },
           {
             href: 'https://dlthub.com/community',
-            label: 'Join community',
             position: 'right',
             className: 'slack-navbar',
           },
           {
             href: 'https://github.com/dlt-hub/dlt',
-            label: 'Star us',
             position: 'right',
             className: 'github-navbar',
             "aria-label": "GitHub repository",

@@ -24,6 +24,7 @@ import sqlglot.expressions
 from dlt.common.libs.sqlglot import TSqlGlotDialect
 from dlt.common import pendulum, logger
 from dlt.common.destination.capabilities import DataTypeMapper
+from dlt.common.destination.exceptions import WriteDispositionNotSupported
 from dlt.common.destination.utils import resolve_replace_strategy
 from dlt.common.json import json
 from dlt.common.schema.typing import (
@@ -43,7 +44,12 @@ from dlt.common.schema.utils import (
 )
 from dlt.common.utils import read_dialect_and_sql
 from dlt.common.storages import FileStorage
-from dlt.common.storages.load_package import LoadJobInfo, ParsedLoadJobFileName
+from dlt.common.storages.load_package import (
+    LoadJobInfo,
+    ParsedLoadJobFileName,
+    load_package_state,
+    CurrentLoadPackageStateNotAvailable,
+)
 from dlt.common.schema import TColumnSchema, Schema, TTableSchemaColumns, TSchemaTables
 from dlt.common.schema import TColumnHint
 from dlt.common.destination.client import (
@@ -264,6 +270,7 @@ class SqlJobClientBase(WithSqlClient, JobClientBase, WithStateSync):
         )
         self.active_hints: Dict[TColumnHint, str] = {}
         self.type_mapper: DataTypeMapper = None
+        self.allow_merge_to_append_fallback: bool = False
         super().__init__(schema, config, sql_client.capabilities)
         self.sql_client = sql_client
         assert isinstance(config, DestinationClientDwhConfiguration)
@@ -288,6 +295,7 @@ class SqlJobClientBase(WithSqlClient, JobClientBase, WithStateSync):
                 self.sql_client.drop_dataset()
 
     def initialize_storage(self, truncate_tables: Iterable[str] = None) -> None:
+        self._set_query_tags(operation="prepare_storage")
         if not self.is_storage_initialized():
             self.sql_client.create_dataset()
         elif truncate_tables:
@@ -301,6 +309,7 @@ class SqlJobClientBase(WithSqlClient, JobClientBase, WithStateSync):
         only_tables: Iterable[str] = None,
         expected_update: TSchemaTables = None,
     ) -> Optional[TSchemaTables]:
+        self._set_query_tags(operation="update_stored_schema")
         super().update_stored_schema(only_tables, expected_update)
         applied_update: TSchemaTables = {}
         schema_info = self.get_stored_schema_by_hash(self.schema.stored_version_hash)
@@ -327,6 +336,7 @@ class SqlJobClientBase(WithSqlClient, JobClientBase, WithStateSync):
             tables: Names of tables to drop.
             delete_schema: If True, also delete all versions of the current schema from storage
         """
+        self._set_query_tags(operation="drop_tables")
         with self.maybe_ddl_transaction():
             self.sql_client.drop_tables(*tables)
             if delete_schema:
@@ -409,6 +419,7 @@ class SqlJobClientBase(WithSqlClient, JobClientBase, WithStateSync):
         return None
 
     def complete_load(self, load_id: str) -> None:
+        self._set_query_tags(operation="complete_load", load_id=load_id)
         name = self.sql_client.make_qualified_table_name(self.schema.loads_table_name)
         now_ts = pendulum.now()
         self.sql_client.execute_sql(
@@ -527,6 +538,7 @@ class SqlJobClientBase(WithSqlClient, JobClientBase, WithStateSync):
         pass
 
     def get_stored_schema(self, schema_name: str = None) -> StorageSchemaInfo:
+        self._set_query_tags(operation="get_stored_schema")
         name = self.sql_client.make_qualified_table_name(self.schema.version_table_name)
         c_schema_name, c_inserted_at = self._norm_and_escape_columns("schema_name", "inserted_at")
         if not schema_name:
@@ -543,6 +555,7 @@ class SqlJobClientBase(WithSqlClient, JobClientBase, WithStateSync):
             return self._row_to_schema_info(query, schema_name)
 
     def get_stored_state(self, pipeline_name: str) -> StateInfo:
+        self._set_query_tags(operation="get_stored_state")
         state_table = self.sql_client.make_qualified_table_name(self.schema.state_table_name)
         loads_table = self.sql_client.make_qualified_table_name(self.schema.loads_table_name)
         c_load_id, c_dlt_load_id, c_pipeline_name, c_status = self._norm_and_escape_columns(
@@ -598,7 +611,7 @@ class SqlJobClientBase(WithSqlClient, JobClientBase, WithStateSync):
         """
         query = f"""
 SELECT {",".join(self._get_storage_table_query_columns())}
-    FROM INFORMATION_SCHEMA.COLUMNS
+    FROM {self.sql_client._qualify_info_schema_table_name("COLUMNS")}
 WHERE """
 
         db_params = []
@@ -878,9 +891,20 @@ WHERE """
         if exceptions := verify_schema_merge_disposition(
             self.schema, loaded_tables, self.capabilities, warnings=True
         ):
+            filtered = []
             for exception in exceptions:
-                logger.error(str(exception))
-            raise exceptions[0]
+                if (
+                    isinstance(exception, WriteDispositionNotSupported)
+                    and self.allow_merge_to_append_fallback
+                ):
+                    # some destinations allow fallback to append so just warn
+                    logger.warning(str(exception))
+                else:
+                    filtered.append(exception)
+                    logger.error(str(exception))
+            if filtered:
+                raise filtered[0]
+
         if exceptions := verify_schema_replace_disposition(
             self.schema,
             loaded_tables,
@@ -894,24 +918,39 @@ WHERE """
         return loaded_tables
 
     def prepare_load_job_execution(self, job: RunnableLoadJob) -> None:
-        self._set_query_tags_for_job(load_id=job._load_id, table=job._load_table)
+        self._set_query_tags(operation="load", load_id=job._load_id, table=job._load_table)
 
-    def _set_query_tags_for_job(self, load_id: str, table: PreparedTableSchema) -> None:
-        """Sets query tags in sql_client for a job in package `load_id`, starting for a particular `table`"""
+    def _set_query_tags(
+        self, operation: str, *, load_id: str = "", table: Optional[PreparedTableSchema] = None
+    ) -> None:
         from dlt.common.pipeline import current_pipeline
+
+        if not load_id:
+            try:
+                load_id = load_package_state()["load_id"]
+            except CurrentLoadPackageStateNotAvailable:
+                load_id = ""
 
         pipeline = current_pipeline()
         pipeline_name = pipeline.pipeline_name if pipeline else ""
+        if table:
+            table_name = table["name"] if table else ""
+            resource = (
+                get_inherited_table_hint(
+                    self.schema.tables, table_name, "resource", allow_none=True
+                )
+                or ""
+            )
+        else:
+            table_name = ""
+            resource = ""
+
         self.sql_client.set_query_tags(
             {
+                "operation": operation,
                 "source": self.schema.name,
-                "resource": (
-                    get_inherited_table_hint(
-                        self.schema.tables, table["name"], "resource", allow_none=True
-                    )
-                    or ""
-                ),
-                "table": table["name"],
+                "resource": resource,
+                "table": table_name,
                 "load_id": load_id,
                 "pipeline_name": pipeline_name,
             }

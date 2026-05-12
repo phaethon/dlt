@@ -22,7 +22,6 @@ from typing import (
     Union,
     Mapping,
 )
-from typing_extensions import NotRequired
 
 from dlt.common.configuration.specs.pluggable_run_context import RunContextBase
 from dlt.common.typing import TypedDict
@@ -52,7 +51,7 @@ from dlt.common.schema.typing import (
 from dlt.common.storages.load_package import ParsedLoadJobFileName
 from dlt.common.storages.load_storage import LoadPackageInfo
 from dlt.common.time import ensure_pendulum_datetime_utc, precise_time
-from dlt.common.typing import DictStrAny, StrAny, SupportsHumanize, TColumnNames
+from dlt.common.typing import DictStrAny, StrAny, SupportsHumanize, TColumnNames, NotRequired
 from dlt.common.data_writers.writers import TLoaderFileFormat
 from dlt.common.utils import RowCounts, merge_row_counts
 from dlt.common.versioned_state import TVersionedState
@@ -197,7 +196,7 @@ class _ExtractInfo(NamedTuple):
     first_run: bool
 
 
-class ExtractInfo(StepInfo[ExtractMetrics], _ExtractInfo):  # type: ignore[misc]
+class ExtractInfo(StepInfo[ExtractMetrics], _ExtractInfo):
     """A tuple holding information on extracted data items. Returned by pipeline `extract` method."""
 
     def asdict(self) -> DictStrAny:
@@ -259,7 +258,7 @@ class _NormalizeInfo(NamedTuple):
     first_run: bool
 
 
-class NormalizeInfo(StepInfo[NormalizeMetrics], _NormalizeInfo):  # type: ignore[misc]
+class NormalizeInfo(StepInfo[NormalizeMetrics], _NormalizeInfo):
     """A tuple holding information on normalized data items. Returned by pipeline `normalize` method."""
 
     @property
@@ -327,7 +326,7 @@ class _LoadInfo(NamedTuple):
     first_run: bool
 
 
-class LoadInfo(StepInfo[LoadMetrics], _LoadInfo):  # type: ignore[misc]
+class LoadInfo(StepInfo[LoadMetrics], _LoadInfo):
     """A tuple holding the information on recently loaded packages. Returned by pipeline `run` and `load` methods"""
 
     def asdict(self) -> DictStrAny:
@@ -341,7 +340,13 @@ class LoadInfo(StepInfo[LoadMetrics], _LoadInfo):  # type: ignore[misc]
             assert len(metrics_list) == 1
             metrics = metrics_list[0]
             for job_metrics in metrics["job_metrics"].values():
-                load_metrics["job_metrics"].append({"load_id": load_id, **job_metrics._asdict()})
+                load_metrics["job_metrics"].append(
+                    {
+                        "load_id": load_id,
+                        "dataset_name": metrics.get("dataset_name"),
+                        **job_metrics._asdict(),
+                    }
+                )
 
         d.update(load_metrics)
         return d
@@ -479,6 +484,8 @@ class TPipelineLocalState(TypedDict, total=False):
     """Run dir when pipeline was instantiated for a first time, defaults to cwd on OSS run context"""
     last_run_context: Optional[TLastRunContext]
     """Context from the last successful pipeline run or sync"""
+    _dev_mode: bool
+    """Tracks whether pipeline was created in dev_mode"""
 
 
 class TPipelineState(TVersionedState, total=False):

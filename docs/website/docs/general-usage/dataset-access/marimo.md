@@ -12,10 +12,10 @@ This page shows how dlt + marimo + [ibis](./ibis-backend.md) provide a rich envi
 
 ## Prerequisites
 
-To install marimo and ibis with the duckdb extras, run the following command: 
+Install the workspace extra, which includes marimo, ibis, and DuckDB:
 
 ```sh
-pip install marimo "ibis-framework[duckdb]"
+pip install "dlt[workspace]"
 ```
 
 ## Launch marimo
@@ -33,23 +33,31 @@ Here's a screenshot of the interface you should see:
 
 ![](./static/marimo_notebook.png)
 
+To run an existing local marimo notebook:
+```sh
+marimo run my_notebook.py
+```
 
 ## Features
 
 ### Use custom dlt widgets
 
-Inside your marimo notebook, you can use widgets built and maintained by the dlt team.
+Inside your marimo notebook, you can use composable widgets built and maintained by the dlt team. This requires the `mowidgets` package (Python 3.11+).
 
-Simply import them from `dlt.helpers.marimo` and pass them to the `render()` function. Note that `render()` is asynchronous and must be awaited with `await`.
+Import them from `dlt.helpers.marimo` and pass them to the `render()` function:
 
 ```py
 #%% cell 1
-import marimo as mo
-from dlt.helpers.marimo import render, load_package_viewer
+from dlt.helpers.marimo import render, load_package_viewer, pipeline_selector
 
 #%% cell 2
-await render(load_package_viewer)
+render(pipeline_selector)
+
+#%% cell 3
+render(load_package_viewer, pipeline_path="/path/to/pipeline")
 ```
+
+Available widgets: `pipeline_selector`, `load_package_viewer`, `schema_viewer`.
 
 ![Example marimo widget](https://storage.googleapis.com/dlt-blog-images/marimo-widget-screenshot.png)
 
@@ -87,7 +95,7 @@ The **Datasources** displays a limited range of data types.
 
 ### Create a dashboard and data apps
 
-marimo notebooks can be [deployed as web applications with interactive UI and charts](https://docs.marimo.io/guides/apps/) and the code hidden. Try adding [marimo UI input elements](https://docs.marimo.io/guides/interactivity/), rich markdown, and charts (matplotlib, plotly, altair, etc.). Combined, dlt + marimo + ibis make it easy to build a simple dashboard on top of fresh data.
+Marimo notebooks can also be [deployed as web applications with interactive UI and charts](https://docs.marimo.io/guides/apps/) and the code hidden. Try adding [marimo UI input elements](https://docs.marimo.io/guides/interactivity/), rich markdown, and charts (matplotlib, plotly, altair, etc.). Combined, dlt + marimo + ibis make it easy to build a simple dashboard on top of fresh data.
 
 
 ## Further reading

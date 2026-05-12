@@ -2,6 +2,7 @@ import gzip
 import os
 import re
 import stat
+import time
 import errno
 import shutil
 import pathvalidate
@@ -12,6 +13,8 @@ from dlt.common.utils import encoding_for_mode, uniq_id
 
 
 FILE_COMPONENT_INVALID_CHARACTERS = re.compile(r"[.%{}]")
+WINDOWS_TREE_RENAME_RETRIES = 3
+WINDOWS_TREE_RENAME_RETRY_ERRNOS = {errno.EACCES, errno.EPERM}
 
 
 class FileStorage:
@@ -208,14 +211,34 @@ class FileStorage:
     def rename_tree(self, from_relative_path: str, to_relative_path: str) -> None:
         """Renames a tree using os.rename if possible making it atomic
 
-        If we get 'too many open files': in that case `rename_tree_files is used
+        If we get 'too many open files' or a transient Windows access denied
+        during directory rename, `rename_tree_files` is used. On Windows, NTFS
+        may briefly hold directory handles after file operations inside the
+        tree, so EACCES/EPERM are retried with a short backoff before falling
+        back (same strategy as pip).
         """
-
         try:
             self.atomic_rename(from_relative_path, to_relative_path)
             return
         except OSError as ex:
-            if ex.errno != errno.EMFILE:
+            if ex.errno == errno.EMFILE:
+                pass
+            elif (
+                os.name == "nt"
+                and ex.errno in WINDOWS_TREE_RENAME_RETRY_ERRNOS
+                and not os.path.exists(self.make_full_path(to_relative_path))
+            ):
+                for attempt in range(1, WINDOWS_TREE_RENAME_RETRIES):
+                    time.sleep(0.05 * attempt)
+                    try:
+                        self.atomic_rename(from_relative_path, to_relative_path)
+                        return
+                    except OSError as retry_ex:
+                        if retry_ex.errno == errno.EMFILE:
+                            break
+                        if retry_ex.errno not in WINDOWS_TREE_RENAME_RETRY_ERRNOS:
+                            raise
+            else:
                 raise
         self.rename_tree_files(from_relative_path, to_relative_path)
 
@@ -268,9 +291,11 @@ class FileStorage:
         if not os.path.isabs(path):
             path = os.path.join(self.storage_path, path)
         file = os.path.realpath(path)
-        # return true, if the common prefix of both is equal to directory
-        # e.g. /a/b/c/d.rst and directory is /a/b, the common prefix is /a/b
-        return os.path.commonprefix([file, self.storage_path]) == self.storage_path
+        try:
+            return os.path.commonpath([file, self.storage_path]) == self.storage_path
+        except ValueError:
+            # paths on different drives on windows
+            return False
 
     def to_relative_path(self, path: str) -> str:
         if path == "":
@@ -320,12 +345,9 @@ class FileStorage:
 
     @staticmethod
     def rmtree_del_ro(action: AnyFun, name: str, exc: Any) -> Any:
-        if action is os.unlink or action is os.remove or action is os.rmdir:
+        if action in (os.unlink, os.remove, os.rmdir):
             os.chmod(name, stat.S_IWRITE)
-            if os.path.isdir(name):
-                os.rmdir(name)
-            else:
-                os.remove(name)
+            action(name)
 
     @staticmethod
     def open_zipsafe_ro(path: str, mode: str = "r", **kwargs: Any) -> IO[Any]:

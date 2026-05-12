@@ -38,7 +38,7 @@ from dlt.extract.pipe import Pipe
 from dlt.extract.items_transform import ItemTransform
 
 from tests.pipeline.utils import PIPELINE_TEST_CASES_PATH
-from tests.utils import TEST_STORAGE_ROOT, temporary_telemetry
+from tests.utils import get_test_storage_root, temporary_telemetry
 
 
 def test_create_trace(toml_providers: ConfigProvidersContainer, environment: Any) -> None:
@@ -234,7 +234,7 @@ def test_create_trace(toml_providers: ConfigProvidersContainer, environment: Any
 
     # copy trace to well known location so it can be used as fixture
     # NOTE: uncomment block below to generate fixture for test_trace_backward_compat
-    # trace_dir = os.path.join(TEST_STORAGE_ROOT, f"dlt.{dlt.__version__}")
+    # trace_dir = os.path.join(get_test_storage_root(), f"dlt.{dlt.__version__}")
     # os.makedirs(trace_dir)
     # save_trace(trace_dir, pipeline._last_trace)
 
@@ -295,7 +295,7 @@ def test_trace_schema() -> None:
                 }
             ],
         )
-        def data():
+        def data(id_=dlt.sources.incremental("id")):
             yield [{"id": 1, "multi": "1.2"}, {"id": 2}, {"id": 3}]
 
         return data()
@@ -337,7 +337,9 @@ def test_trace_schema() -> None:
     pipeline = dlt.pipeline(
         pipeline_name="test_trace_schema",
         destination=dummy_dest,
-        staging=filesystem(os.path.abspath(os.path.join(TEST_STORAGE_ROOT, "_remote_filesystem"))),
+        staging=filesystem(
+            os.path.abspath(os.path.join(get_test_storage_root(), "_remote_filesystem"))
+        ),
         dataset_name="various",
     )
 
@@ -350,11 +352,15 @@ def test_trace_schema() -> None:
     trace = pipeline.last_trace
     pipeline._schema_storage.storage.save("trace.json", json.dumps(trace, pretty=True))
 
-    schema = dlt.Schema("trace")
+    # load existing contract as schema and let it evolve with new columns/tables
+    with open(f"{PIPELINE_TEST_CASES_PATH}/contracts/trace.schema.yaml", encoding="utf-8") as f:
+        imported_schema = yaml.safe_load(f)
+    evolving_schema = Schema.from_dict(imported_schema, remove_processing_hints=True)
+
     trace_pipeline = dlt.pipeline(
         pipeline_name="test_trace_schema_traces", destination=dummy(completed_prob=1.0)
     )
-    trace_pipeline.run([trace], table_name="trace", schema=schema)
+    trace_pipeline.run([trace], table_name="trace", schema=evolving_schema)
 
     # add exception trace
     with pytest.raises(PipelineStepFailed):
@@ -375,10 +381,10 @@ def test_trace_schema() -> None:
     pipeline._schema_storage.storage.save("trace.schema.yaml", inferred_contract_str)
     # print(pipeline._schema_storage.storage.storage_path)
 
-    # load the schema and use it as contract
+    # reload the original contract and use it with freeze to verify no breaking changes
     with open(f"{PIPELINE_TEST_CASES_PATH}/contracts/trace.schema.yaml", encoding="utf-8") as f:
-        imported_schema = yaml.safe_load(f)
-    trace_contract = Schema.from_dict(imported_schema, remove_processing_hints=True)
+        contract_schema = yaml.safe_load(f)
+    trace_contract = Schema.from_dict(contract_schema, remove_processing_hints=True)
     # compare pretty forms of the schemas, they must be identical
     # NOTE: if this fails you can comment this out and use contract run below to find first offending difference
     # assert trace_contract.to_pretty_yaml() == inferred_contract_str
@@ -464,6 +470,37 @@ def test_save_load_trace() -> None:
     assert step.step_exception == run_step.step_exception
     assert_trace_serializable(trace)
     assert pipeline.last_trace.last_normalize_info is None
+
+
+def test_run_step_with_exception_not_filtered_in_asdict() -> None:
+    """Run step carrying an exception from sync_destination must survive asdict()."""
+    pipeline = dlt.pipeline(destination="dummy")
+
+    def _failing_sync(self, *args, **kwargs):
+        raise PipelineStepFailed(pipeline, "sync", None, RuntimeError("sync failed"))
+
+    with patch.object(Pipeline, "_sync_destination", _failing_sync):
+        with pytest.raises(PipelineStepFailed):
+            pipeline.run([1, 2, 3], table_name="items")
+
+    trace = pipeline.last_trace
+    assert trace is not None
+
+    # only the "run" step should exist because extract/normalize/load never started
+    run_steps = [s for s in trace.steps if s.step == "run"]
+    assert len(run_steps) == 1
+    assert run_steps[0].step_exception is not None
+    assert "sync failed" in run_steps[0].step_exception
+
+    # asdict() must include the run step with the exception
+    trace_dict = trace.asdict()
+    dict_steps = trace_dict["steps"]
+    run_dict_steps = [s for s in dict_steps if s["step"] == "run"]
+    assert len(run_dict_steps) == 1
+    assert run_dict_steps[0]["step_exception"] is not None
+    assert "sync failed" in run_dict_steps[0]["step_exception"]
+
+    assert_trace_serializable(trace)
 
 
 def test_save_load_empty_trace() -> None:
@@ -779,10 +816,7 @@ def test_trace_custom_metrics_schema() -> None:
     assert "custom_metrics__random_constant" in resource_metrics_table_cols
     assert "custom_metrics__random_nested__value" in resource_metrics_table_cols
     assert "custom_metrics__random_nested__unit" in resource_metrics_table_cols
-    assert (
-        "trace__steps__extract_info__resource_metrics__custom_metrics__list_metric"
-        in inferred_schema.tables
-    )
+    assert "trace__steps__extract_info__resource_metrics__list_metric" in inferred_schema.tables
 
 
 @pytest.mark.skipif(

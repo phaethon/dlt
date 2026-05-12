@@ -57,13 +57,9 @@ INVALID_CONFIGS = [
         },
     ),
     # expect missing api_key at the right config section coming from the dict notation
-    # TODO: currently this test fails on validation, api_key is necessary. validation happens
-    #   before secrets are bound, this must be changed
     ConfigTest(
-        expected_message=(
-            "For `ApiKeyAuthConfig`: Path `./client/auth`: missing required fields `{'api_key'}`"
-        ),
-        exception=DictValidationException,
+        expected_message="SOURCES__REST_API__INVALID_CONFIG__CREDENTIALS__API_KEY",
+        exception=ConfigFieldMissingException,
         config={
             "client": {
                 "base_url": "https://api.example.com",
@@ -252,7 +248,7 @@ VALID_CONFIGS: List[RESTAPIConfig] = [
         "client": {
             "base_url": "https://example.com",
             "paginator": CustomPaginator(),
-            "auth": CustomOAuthAuth(access_token=cast(TSecretStrValue, "X")),
+            "auth": CustomOAuthAuth(access_token="X"),
         },
         "resource_defaults": {
             "table_name": lambda event: event["type"],
@@ -275,7 +271,7 @@ VALID_CONFIGS: List[RESTAPIConfig] = [
         "client": {
             "base_url": "https://example.com",
             "paginator": "header_link",
-            "auth": HttpBasicAuth("my-secret", cast(TSecretStrValue, "")),
+            "auth": HttpBasicAuth("my-secret", ""),
         },
         "resources": ["users"],
     },

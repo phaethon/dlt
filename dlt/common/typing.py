@@ -33,6 +33,7 @@ from typing_extensions import (
     ForwardRef,
     Annotated,
     Never,
+    NotRequired,
     ParamSpec,
     TypeAlias,
     Concatenate,
@@ -126,6 +127,8 @@ TDataItems: TypeAlias = Union[TDataItem, List[TDataItem]]
 "A single data item or a list as extracted from the data source"
 TAnyDateTime = Union[pendulum.DateTime, pendulum.Date, datetime, date, str, float, int]
 """DateTime represented as pendulum/python object, ISO string or unix timestamp"""
+TTimeInterval = Tuple[datetime, datetime]
+"""Half-open time interval `[start, end)` as timezone-aware datetimes."""
 TVariantBase = TypeVar("TVariantBase", covariant=True)
 TVariantRV = Tuple[str, Any]
 VARIANT_FIELD_FORMAT = "v_%s"
@@ -470,8 +473,8 @@ def get_generic_type_argument_from_instance(
     if cls_:
         orig_param_type = get_args(cls_)[0]
     if orig_param_type in (Any, CallableAny) and sample_value is not None:
-        orig_param_type = type(sample_value)  # type: ignore[assignment]
-    return orig_param_type  # type: ignore
+        orig_param_type = type(sample_value)
+    return orig_param_type
 
 
 TInputArgs = ParamSpec("TInputArgs")

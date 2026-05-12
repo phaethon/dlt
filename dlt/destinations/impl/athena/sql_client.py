@@ -9,6 +9,7 @@ from typing import (
     Dict,
     Callable,
     Type,
+    TYPE_CHECKING,
 )
 from copy import deepcopy
 import re
@@ -20,6 +21,13 @@ from datetime import datetime  # noqa: I251
 import pyathena
 from pyathena import connect
 from pyathena.connection import Connection
+
+if TYPE_CHECKING:
+    from pyathena.cursor import Cursor
+
+    AthenaConnection = Connection[Cursor]
+else:
+    AthenaConnection = Any
 from pyathena.error import OperationalError, DatabaseError, ProgrammingError, IntegrityError, Error
 from pyathena.formatter import (
     DefaultParameterFormatter,
@@ -45,7 +53,10 @@ from dlt.destinations.sql_client import (
     raise_database_error,
     raise_open_connection_error,
 )
-from dlt.destinations.impl.athena.configuration import AthenaClientConfiguration
+from dlt.destinations.impl.athena.configuration import (
+    DEFAULT_AWS_DATA_CATALOG,
+    AthenaClientConfiguration,
+)
 
 
 # add a formatter for pendulum to be used by pyathen dbapi
@@ -78,7 +89,7 @@ class DLTAthenaFormatter(DefaultParameterFormatter):
         DLTAthenaFormatter._INSTANCE = self
 
 
-class AthenaSQLClient(SqlClientBase[Connection]):
+class AthenaSQLClient(SqlClientBase[AthenaConnection]):
     dbapi: ClassVar[DBApi] = pyathena
 
     def __init__(
@@ -89,13 +100,17 @@ class AthenaSQLClient(SqlClientBase[Connection]):
         capabilities: DestinationCapabilitiesContext,
     ) -> None:
         super().__init__(None, dataset_name, staging_dataset_name, capabilities)
-        self._conn: Connection = None
+        self._conn: AthenaConnection = None
         self.config = config
         self.credentials = config.credentials
 
     @raise_open_connection_error
-    def open_connection(self) -> Connection:
-        self._conn = connect(schema_name=self.dataset_name, **self.config.to_connector_params())
+    def open_connection(self) -> AthenaConnection:
+        # set `use_catalog_name` to False because we use fully qualified table names including
+        # catalog in all queries and we may (depending on user config) do cross-catalog queries
+        self._conn = connect(
+            schema_name=self.dataset_name, **self.config.to_connector_params(use_catalog_name=False)
+        )
         return self._conn
 
     def close_connection(self) -> None:
@@ -103,8 +118,34 @@ class AthenaSQLClient(SqlClientBase[Connection]):
         self._conn = None
 
     @property
-    def native_connection(self) -> Connection:
+    def native_connection(self) -> AthenaConnection:
         return self._conn
+
+    def catalog_name(
+        self, quote: bool = True, casefold: bool = True, ddl: bool = False
+    ) -> Optional[str]:
+        catalog_name = self.config.aws_data_catalog
+
+        if self.is_staging_dataset_active:
+            if self.config.staging_aws_data_catalog is None:
+                if self.config._is_s3_tables_catalog():
+                    # staging dataset has Parquet tables, which we can't register in S3 Tables
+                    # Catalog; hence, use default catalog
+                    catalog_name = DEFAULT_AWS_DATA_CATALOG
+            else:
+                catalog_name = self.config.staging_aws_data_catalog
+
+        if casefold:
+            catalog_name = self.capabilities.casefold_identifier(catalog_name)
+        if quote:
+            escaper = self.escape_ddl_identifier if ddl else self.capabilities.escape_identifier
+            catalog_name = escaper(catalog_name)
+
+        return catalog_name
+
+    def _qualify_info_schema_table_name(self, table_name: str) -> str:
+        catalog_name = self.catalog_name()
+        return f"{catalog_name}.{super()._qualify_info_schema_table_name(table_name)}"
 
     def escape_ddl_identifier(self, v: str) -> str:
         # https://docs.aws.amazon.com/athena/latest/ug/tables-databases-columns-names.html
@@ -116,7 +157,9 @@ class AthenaSQLClient(SqlClientBase[Connection]):
         return escape_hive_identifier(v)
 
     def fully_qualified_ddl_dataset_name(self) -> str:
-        return self.escape_ddl_identifier(self.dataset_name)
+        catalog_name = self.catalog_name(ddl=True)
+        schema_name = self.escape_ddl_identifier(self.dataset_name)
+        return f"{catalog_name}.{schema_name}"
 
     def make_qualified_ddl_table_name(self, table_name: str) -> str:
         table_name = self.escape_ddl_identifier(table_name)

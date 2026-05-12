@@ -220,8 +220,14 @@ class DestinationCapabilitiesContext(ContainerInjectableContext):
     supports_tz_aware_datetime: bool = True
     """The destination can store datetime with timezone"""
 
+    supports_tz_aware_datetime_in_cast: Optional[bool] = None
+    """Can use tz aware literals in CAST"""
+
     supports_naive_datetime: bool = True
     """The destination can store datetime without timezone"""
+
+    dialect_capabilities: Optional[Any] = None
+    """Capabilities of selected dialect for multi-dialect destinations ie. SQLAlchemy"""
 
     def generates_case_sensitive_identifiers(self) -> bool:
         """Tells if capabilities as currently adjusted, will generate case sensitive identifiers"""

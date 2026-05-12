@@ -1,7 +1,7 @@
 import io
 import pytest
 import time
-from typing import Iterator
+from typing import Iterator, Any
 
 from dlt.common import pendulum, json
 from dlt.common.data_writers.exceptions import DataWriterNotFound, SpecLookupFailed
@@ -14,6 +14,10 @@ from dlt.common.data_writers.escape import (
     escape_redshift_literal,
     escape_postgres_literal,
     escape_duckdb_literal,
+    escape_bigquery_literal,
+    escape_bigquery_identifier,
+    format_datetime_literal,
+    format_datetime_value,
 )
 
 # import all writers here to check if it can be done without all the dependencies
@@ -38,7 +42,12 @@ from dlt.common.data_writers.writers import (
 
 from tests.common.utils import load_json_case, row_to_column_schemas
 
-ALL_LITERAL_ESCAPE = [escape_redshift_literal, escape_postgres_literal, escape_duckdb_literal]
+ALL_LITERAL_ESCAPE = [
+    escape_redshift_literal,
+    escape_postgres_literal,
+    escape_duckdb_literal,
+    escape_bigquery_literal,
+]
 
 
 class _StringIOWriter(DataWriter):
@@ -147,6 +156,47 @@ def test_string_nested_escape(escaper: AnyFun) -> None:
         assert escaped == escaper(json.dumps(doc))
 
 
+@pytest.mark.parametrize(
+    "precision,tz_form,naive_input,expected",
+    [
+        # naive input — no_tz toggle has no effect
+        (6, "naive", False, "2024-03-04 05:06:07.123456"),
+        (3, "naive", False, "2024-03-04 05:06:07.123"),
+        (0, "naive", False, "2024-03-04 05:06:07"),
+        # tz-aware UTC — no_tz=False keeps the offset
+        (6, "utc", False, "2024-03-04 05:06:07.123456+00:00"),
+        (3, "utc", False, "2024-03-04 05:06:07.123+00:00"),
+        (0, "utc", False, "2024-03-04 05:06:07+00:00"),
+        # tz-aware UTC — no_tz=True strips the offset, value unchanged
+        (6, "utc", True, "2024-03-04 05:06:07.123456"),
+        (3, "utc", True, "2024-03-04 05:06:07.123"),
+        # tz-aware non-UTC — no_tz=True converts to UTC then strips
+        # 05:06:07 Europe/Berlin (UTC+1, CET, no DST in March before the last Sunday) -> 04:06:07 UTC
+        (6, "berlin", True, "2024-03-04 04:06:07.123456"),
+        (3, "berlin", True, "2024-03-04 04:06:07.123"),
+        # tz-aware non-UTC — no_tz=False keeps original offset
+        (6, "berlin", False, "2024-03-04 05:06:07.123456+01:00"),
+    ],
+    ids=lambda v: str(v),
+)
+def test_format_datetime_value(
+    precision: int, tz_form: str, naive_input: bool, expected: str
+) -> None:
+    if tz_form == "naive":
+        v = pendulum.naive(2024, 3, 4, 5, 6, 7, 123456)
+    elif tz_form == "utc":
+        v = pendulum.datetime(2024, 3, 4, 5, 6, 7, 123456, tz="UTC")
+    elif tz_form == "berlin":
+        v = pendulum.datetime(2024, 3, 4, 5, 6, 7, 123456, tz="Europe/Berlin")
+    else:
+        pytest.fail(f"unknown tz_form {tz_form}")
+
+    value = format_datetime_value(v, precision=precision, no_tz=naive_input)
+    assert value == expected
+    # format_datetime_literal is a thin wrapper that adds quotes
+    assert format_datetime_literal(v, precision=precision, no_tz=naive_input) == f"'{expected}'"
+
+
 def test_identifier_escape() -> None:
     assert (
         escape_redshift_identifier(", NULL'); DROP TABLE\" -\\-")
@@ -154,7 +204,7 @@ def test_identifier_escape() -> None:
     )
 
 
-def test_identifier_escape_bigquery() -> None:
+def test_escape_hive_identifier() -> None:
     assert (
         escape_hive_identifier(", NULL'); DROP TABLE\"` -\\-")
         == "`, NULL'); DROP TABLE\"\\` -\\\\-`"
@@ -173,6 +223,62 @@ def test_string_literal_escape_unicode() -> None:
         escape_redshift_identifier('イロハニホヘト チリヌルヲ "ワカヨタレソ ツネナラム')
         == '"イロハニホヘト チリヌルヲ ""ワカヨタレソ ツネナラム"'
     )
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (", NULL'); DROP TABLE --", "', NULL\\'); DROP TABLE --'"),
+        ("", "''"),
+        ("hello\tworld", "'hello\\tworld'"),
+        ("bell\a", "'bell\\a'"),
+        ("path\\to\\file", "'path\\\\to\\\\file'"),
+        (b"hello", "FROM_BASE64('aGVsbG8=')"),
+        (b"\x00\x01\x02", "FROM_BASE64('AAEC')"),
+        (pendulum.datetime(2023, 1, 15, 12, 30, 45), "'2023-01-15T12:30:45+00:00'"),
+        (pendulum.date(2023, 1, 15), "'2023-01-15'"),
+        (
+            {"key": "value", "nested": {"inner": "data"}},
+            '\'{"key":"value","nested":{"inner":"data"}}\'',
+        ),
+        ([1, 2, 3, "four"], "'[1,2,3,\"four\"]'"),
+        (True, "TRUE"),
+        (False, "FALSE"),
+        (None, "NULL"),
+        (
+            "イロハニホヘト チリヌルヲ ワカヨタレソ ツネナラム",
+            "'イロハニホヘト チリヌルヲ ワカヨタレソ ツネナラム'",
+        ),
+    ],
+    ids=[
+        "sql_injection_attempt",
+        "empty_string",
+        "tab_char",
+        "bell_char",
+        "backslash_path",
+        "bytes_simple",
+        "bytes_binary",
+        "datetime",
+        "date",
+        "dict_json",
+        "list_json",
+        "bool_true",
+        "bool_false",
+        "null",
+        "unicode_japanese",
+    ],
+)
+def test_bigquery_literal_escape(value: Any, expected: str) -> None:
+    """Test escape_bigquery_literal with various datatypes."""
+    result = escape_bigquery_literal(value)
+    assert result == expected
+
+
+def test_escape_bigquery_identifier() -> None:
+    # BigQuery identifier escaping uses backticks (same as Hive)
+    assert escape_bigquery_identifier("table_name") == "`table_name`"
+    assert escape_bigquery_identifier("table`name") == "`table\\`name`"
+    assert escape_bigquery_identifier("table\\name") == "`table\\\\name`"
 
 
 def test_data_writer_metrics_add() -> None:

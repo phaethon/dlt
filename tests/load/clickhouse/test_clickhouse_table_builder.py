@@ -1,28 +1,22 @@
 from copy import deepcopy
+from typing import Callable, Optional, Tuple
 
 import pytest
 
 from dlt.common.configuration import resolve_configuration
-from dlt.common.schema import Schema
 from dlt.common.utils import custom_environ, digest128
 from dlt.common.utils import uniq_id
-from dlt.destinations import clickhouse
-from dlt.destinations.impl.clickhouse.clickhouse import ClickHouseClient
+from dlt.destinations.impl.clickhouse.clickhouse import ClickHouseClient, ClickHouseMergeJob
 from dlt.destinations.impl.clickhouse.configuration import (
     ClickHouseCredentials,
     ClickHouseClientConfiguration,
 )
+from dlt.common.schema.utils import new_table, pipeline_state_table
+from tests.load.clickhouse.utils import clickhouse_client
 from tests.load.utils import TABLE_UPDATE, empty_schema
 
-
-@pytest.fixture
-def clickhouse_client(empty_schema: Schema) -> ClickHouseClient:
-    # Return a client without opening connection.
-    creds = ClickHouseCredentials()
-    return clickhouse().client(
-        empty_schema,
-        ClickHouseClientConfiguration(credentials=creds)._bind_dataset_name(f"test_{uniq_id()}"),
-    )
+# mark all tests as essential, do not remove
+pytestmark = pytest.mark.essential
 
 
 def test_clickhouse_configuration() -> None:
@@ -138,6 +132,47 @@ def test_clickhouse_alter_table(clickhouse_client: ClickHouseClient) -> None:
     assert "`col2` Float64" in sql
 
 
+@pytest.mark.parametrize(
+    "naming,case",
+    [
+        (None, str.lower),
+        ("tests.common.cases.normalizers.sql_upper", str.upper),
+    ],
+    ids=["snake_case", "sql_upper"],
+)
+@pytest.mark.parametrize(
+    "schema_table_name,expected_columns",
+    [
+        ("version_table_name", ("schema_name", "inserted_at")),
+        ("state_table_name", ("pipeline_name", "_dlt_load_id")),
+        ("loads_table_name", ("load_id",)),
+    ],
+    ids=["version", "pipeline_state", "loads"],
+)
+def test_clickhouse_internal_metadata_tables_have_sort_keys(
+    clickhouse_client: ClickHouseClient,
+    schema_table_name: str,
+    expected_columns: Tuple[str, ...],
+    naming: Optional[str],
+    case: Callable[[str], str],
+) -> None:
+    if naming is not None:
+        with custom_environ({"SCHEMA__NAMING": naming}):
+            clickhouse_client.schema.update_normalizers()
+
+    if schema_table_name == "state_table_name":
+        clickhouse_client.schema.update_table(pipeline_state_table())
+
+    table_name = getattr(clickhouse_client.schema, schema_table_name)
+    new_columns = list(clickhouse_client.schema.tables[table_name]["columns"].values())
+
+    sql = clickhouse_client._get_table_update_sql(table_name, new_columns, False)[0]
+
+    # uses casing function to approximate UPPER naming convention
+    expected_order_by = "(" + ", ".join(case(c) for c in expected_columns) + ")"
+    assert f"ORDER BY {expected_order_by}" in sql
+
+
 @pytest.mark.usefixtures("empty_schema")
 def test_clickhouse_create_table_with_primary_keys(
     clickhouse_client: ClickHouseClient,
@@ -198,3 +233,105 @@ def test_clickhouse_table_engine_configuration() -> None:
             ClickHouseClientConfiguration(), sections=("destination", "clickhouse")
         )
         assert config.table_engine_type == "replicated_merge_tree"
+
+
+@pytest.mark.parametrize(
+    "has_dedup_sort,hard_delete,expected_engine",
+    [
+        (False, False, "ENGINE = ReplacingMergeTree"),
+        (False, True, "ENGINE = ReplacingMergeTree"),
+        (True, False, "ENGINE = ReplacingMergeTree(`col2`)"),
+        (True, True, "ENGINE = ReplacingMergeTree(`col2`, `col3`)"),
+    ],
+    ids=[
+        "no_version",
+        "hard_delete_without_version",
+        "dedup_sort_only",
+        "dedup_sort_and_hard_delete",
+    ],
+)
+def test_clickhouse_replacing_merge_tree(
+    clickhouse_client: ClickHouseClient,
+    has_dedup_sort: bool,
+    hard_delete: bool,
+    expected_engine: str,
+) -> None:
+    columns = deepcopy(TABLE_UPDATE[:3])
+    columns[0]["primary_key"] = True
+    if has_dedup_sort:
+        columns[1]["dedup_sort"] = "desc"
+    if hard_delete:
+        columns[2]["hard_delete"] = True
+
+    table_name = "rmt_table"
+    clickhouse_client.schema.update_table(
+        new_table(table_name, write_disposition="append", columns=columns)
+    )
+    clickhouse_client.schema.tables[table_name]["x-table-engine-type"] = (  # type: ignore[typeddict-unknown-key]
+        "replacing_merge_tree"
+    )
+
+    sql = clickhouse_client._get_table_update_sql(table_name, columns, False)[0]
+    assert expected_engine in sql
+    assert "PRIMARY KEY (`col1`)" in sql
+
+
+def test_clickhouse_replacing_merge_tree_fallback_non_append(
+    clickhouse_client: ClickHouseClient,
+) -> None:
+    columns = deepcopy(TABLE_UPDATE[:3])
+    columns[0]["primary_key"] = True
+    columns[1]["dedup_sort"] = "desc"
+
+    table_name = "rmt_fallback_table"
+    clickhouse_client.schema.update_table(
+        new_table(table_name, write_disposition="replace", columns=columns)
+    )
+    clickhouse_client.schema.tables[table_name]["x-table-engine-type"] = (  # type: ignore[typeddict-unknown-key]
+        "replacing_merge_tree"
+    )
+
+    sql = clickhouse_client._get_table_update_sql(table_name, columns, False)[0]
+    assert "ENGINE = MergeTree" in sql
+    assert "ReplacingMergeTree" not in sql
+
+
+@pytest.mark.parametrize(
+    "table_engine_type,expected_engine",
+    [
+        ("merge_tree", "MergeTree"),
+        # ReplacingMergeTree's dedup args don't apply to temp tables — collapses to MergeTree
+        ("replacing_merge_tree", "MergeTree"),
+        ("shared_merge_tree", "SharedMergeTree"),
+        ("replicated_merge_tree", "ReplicatedMergeTree"),
+    ],
+    ids=lambda x: x if isinstance(x, str) else "",
+)
+def test_clickhouse_merge_temp_table_engine(
+    clickhouse_client: ClickHouseClient,
+    table_engine_type: str,
+    expected_engine: str,
+) -> None:
+    """Merge delete/insert temp tables follow `config.table_engine_type` so they replicate
+    consistently with the destination tables.
+    """
+    clickhouse_client.config.table_engine_type = table_engine_type  # type: ignore[assignment]
+    sql_client = clickhouse_client.sql_client
+
+    delete_sql, _ = ClickHouseMergeJob.gen_delete_temp_table_sql(
+        "items",
+        "`_dlt_id`",
+        ["FROM dest AS d JOIN staging AS s ON d.`id` = s.`id`"],
+        sql_client,
+    )
+    assert f"ENGINE = {expected_engine}" in delete_sql[0]
+
+    insert_sql, _ = ClickHouseMergeJob.gen_insert_temp_table_sql(
+        "items",
+        "staging",
+        sql_client,
+        primary_keys=["`id`"],
+        unique_column="`_dlt_id`",
+        condition="1 = 1",
+    )
+    assert f"ENGINE = {expected_engine}" in insert_sql[0]

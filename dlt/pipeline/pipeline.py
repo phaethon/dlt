@@ -295,7 +295,8 @@ class Pipeline(SupportsPipeline):
     # default_schema_name: str
     schema_names: List[str]
     dev_mode: bool
-    must_attach_to_local_pipeline: bool
+    attached_pipeline: bool
+    """Pipeline got attached to existing working dir"""
     pipelines_dir: str
     """A directory where the pipelines' working directories are created"""
     _destination: AnyDestination
@@ -354,11 +355,19 @@ class Pipeline(SupportsPipeline):
         self._init_working_dir(pipeline_name, pipelines_dir)
 
         with self.managed_state() as state:
-            self._configure(import_schema_path, export_schema_path, must_attach_to_local_pipeline)
+            self._configure(
+                import_schema_path,
+                export_schema_path,
+                must_attach_to_local_pipeline,
+                managed_state=state,
+            )
             # changing the destination could be dangerous if pipeline has pending load packages
             self._set_destinations(destination=destination, staging=staging, initializing=True)
             # set the pipeline properties from state, destination and staging will not be set
             self._state_to_props(state)
+            # restore dev_mode flag from state when attaching
+            if must_attach_to_local_pipeline:
+                self.dev_mode = state["_local"].get("_dev_mode", False)
             # TODO: compare run_context with last_run_context restored from props. warn on changed uri
             # we overwrite the state with the values from init
             self._set_dataset_name(dataset_name)
@@ -452,7 +461,10 @@ class Pipeline(SupportsPipeline):
         )
         try:
             with self._maybe_destination_capabilities():
-                # extract all sources
+                # extract all sources ordered by schema name
+                # while tracking schema transitions to extract
+                # state to each schema's package in multi-dataset mode
+                last_schema = None
                 for source in data_to_sources(
                     data,
                     self,
@@ -469,6 +481,15 @@ class Pipeline(SupportsPipeline):
                     if source.exhausted:
                         raise SourceExhausted(source.name)
 
+                    if last_schema and source.schema.name != last_schema.name:
+                        if not self.config.use_single_dataset:
+                            self._bump_version_and_extract_state(
+                                self._container[StateInjectableContext].state,
+                                self.config.restore_from_destination,
+                                extract_step,
+                                schema=last_schema,
+                            )
+
                     self._extract_source(
                         extract_step,
                         source,
@@ -477,11 +498,13 @@ class Pipeline(SupportsPipeline):
                         refresh=refresh or self.refresh,
                     )
 
-                # this will update state version hash so it will not be extracted again by with_state_sync
+                    last_schema = source.schema
+
                 self._bump_version_and_extract_state(
                     self._container[StateInjectableContext].state,
                     self.config.restore_from_destination,
                     extract_step,
+                    schema=last_schema if not self.config.use_single_dataset else None,
                 )
                 # commit load packages with state
                 extract_step.commit_packages()
@@ -801,6 +824,15 @@ class Pipeline(SupportsPipeline):
                                 "destination state contains state for pipeline with name"
                                 f" {remote_state['pipeline_name']}",
                             )
+                        # warn if remote state has a different dataset_name
+                        if state["dataset_name"] != remote_state["dataset_name"]:
+                            logger.warning(
+                                f"Pipeline {self.pipeline_name} got restored from destination"
+                                " but the remote state contains a different dataset_name"
+                                f" '{remote_state['dataset_name']}'. The current dataset_name"
+                                f" '{self.dataset_name}' will be used and the pipeline state"
+                                " will be updated accordingly."
+                            )
                         # if state was modified force get all schemas
                         restored_schemas = self._get_schemas_from_destination(
                             remote_state["schema_names"], always_download=True
@@ -824,6 +856,8 @@ class Pipeline(SupportsPipeline):
                     # use remote state as state
                     remote_state["_local"] = state["_local"]
                     state = remote_state
+                    # preserve the user's dataset_name over the remote state value
+                    state["dataset_name"] = self.dataset_name
                     # set the pipeline props from merged state
                     self._state_to_props(state)
                     # add that the state is already extracted
@@ -1232,7 +1266,11 @@ class Pipeline(SupportsPipeline):
             self._wipe_working_folder()
 
     def _configure(
-        self, import_schema_path: str, export_schema_path: str, must_attach_to_local_pipeline: bool
+        self,
+        import_schema_path: str,
+        export_schema_path: str,
+        attach_pipeline: bool,
+        managed_state: Optional[TPipelineState] = None,
     ) -> None:
         # create schema storage and folders
         self._schema_storage_config = SchemaStorageConfiguration(
@@ -1246,20 +1284,39 @@ class Pipeline(SupportsPipeline):
 
         # are we running again?
         has_state = self._pipeline_storage.has_file(Pipeline.STATE_FILE)
-        if must_attach_to_local_pipeline and not has_state:
+        if attach_pipeline and not has_state:
             raise CannotRestorePipelineException(
                 self.pipeline_name,
                 self.pipelines_dir,
                 f"the pipeline was not found in {self.working_dir}.",
             )
 
-        self.must_attach_to_local_pipeline = must_attach_to_local_pipeline
-        # attach to pipeline if folder exists and contains state
+        self.attached_pipeline = attach_pipeline
+
+        # detect dev->non-dev transition from already-loaded state
+        if managed_state is not None and has_state and not attach_pipeline:
+            if managed_state["_local"].get("_dev_mode", False) and not self.dev_mode:
+                logger.warning(
+                    f"Pipeline {self.pipeline_name} was previously created with"
+                    " dev_mode=True and is now being re-created with dev_mode=False."
+                    " Local pipeline state and schemas will be reset. The pipeline"
+                    " will sync state from the destination on the next run or"
+                    " dataset access."
+                )
+                managed_state.clear()  # type: ignore[attr-defined]
+                managed_state.update(default_pipeline_state())
+                has_state = False
+
+        # attach to pipeline if state exists
         if has_state:
             self._attach_pipeline()
         else:
             # this will erase the existing working folder
             self._create_pipeline()
+
+        # persist current dev_mode for future transition detection
+        if managed_state is not None and not attach_pipeline:
+            managed_state["_local"]["_dev_mode"] = self.dev_mode
 
         # create schema storage
         self._schema_storage = LiveSchemaStorage(self._schema_storage_config, makedirs=True)
@@ -1830,11 +1887,14 @@ class Pipeline(SupportsPipeline):
     # NOTE: I expect that we'll merge all relations into one. and then we'll be able to get rid
     #  of overload and dataset_type
 
-    def dataset(self, schema: Union[Schema, str, None] = None) -> dlt.Dataset:
+    def dataset(self, schema: Union[Schema, str, Sequence[Schema], None] = None) -> dlt.Dataset:
         """Returns a dataset object for querying the destination data.
 
         Args:
-            schema (Union[Schema, str, None]): Schema name or Schema object to use. If None, uses the default schema if set.
+            schema (Union[Schema, str, Sequence[Schema], None]): Schema object(s) or name to use.
+                If None, uses the default schema. When ``use_single_dataset`` is True and the
+                pipeline has multiple schemas, all schemas are included automatically.
+
         Returns:
             dlt.Dataset: A dataset object that supports querying the destination data.
         """
@@ -1865,10 +1925,18 @@ class Pipeline(SupportsPipeline):
                 )
             else:
                 schema = self.schemas[schema]
-
+        elif isinstance(schema, Sequence) and not isinstance(schema, str):
+            schema_name = schema[0].name if schema else None
         elif self.default_schema_name:
-            schema = self.default_schema
             schema_name = self.default_schema_name
+            if self.config.use_single_dataset and len(self.schema_names) > 1:
+                # collect all schemas, default first
+                all_names = [self.default_schema_name] + [
+                    n for n in self.schema_names if n != self.default_schema_name
+                ]
+                schema = [self.schemas[n] for n in all_names]
+            else:
+                schema = self.default_schema
 
         try:
             dataset = dlt.dataset(
@@ -1876,6 +1944,7 @@ class Pipeline(SupportsPipeline):
                 self.dataset_name,
                 schema=schema,
             )
+            dataset._pipeline_name = self.pipeline_name
             success = True
             return dataset
         except Exception:

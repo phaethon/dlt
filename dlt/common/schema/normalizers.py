@@ -29,6 +29,8 @@ DEFAULT_NAMING_NAMESPACE = os.environ.get(
     known_env.DLT_DEFAULT_NAMING_NAMESPACE, "dlt.common.normalizers.naming"
 )
 DEFAULT_NAMING_MODULE = os.environ.get(known_env.DLT_DEFAULT_NAMING_MODULE, "snake_case")
+DEFAULT_JSON_NAMESPACE = "dlt.common.normalizers.json"
+DEFAULT_JSON_MODULE = "relational"
 
 
 def _section_for_schema(kwargs: Dict[str, Any]) -> Tuple[str, ...]:
@@ -47,7 +49,7 @@ def configured_normalizers(
     use_break_path_on_normalize: Optional[bool] = None,
     schema_name: Optional[str] = None,
 ) -> TNormalizersConfig:
-    """Gets explicitly onfigured normalizers without any defaults or capabilities injection. If `naming`
+    """Gets explicitly configured normalizers without any defaults or capabilities injection. If `naming`
     is a module or a type it will get converted into string form via import.
 
     If `schema_name` is present, a section ("sources", schema_name, "schema") is used to inject the config
@@ -99,7 +101,12 @@ def import_normalizers(
     explicit_normalizers["names"] = serialize_reference(naming)
 
     item_normalizer = explicit_normalizers.get("json") or default_normalizers.get("json") or {}
-    item_normalizer.setdefault("module", "dlt.common.normalizers.json.relational")
+    item_normalizer.setdefault("module", DEFAULT_JSON_MODULE)
+    # resolve shorthand module names (e.g. "relational" -> "dlt.common.normalizers.json.relational")
+    json_module_name = item_normalizer["module"]
+    if "." not in json_module_name:
+        json_module_name = f"{DEFAULT_JSON_NAMESPACE}.{json_module_name}"
+        item_normalizer["module"] = json_module_name
     # if max_table_nesting is set, we need to set the max_table_nesting in the json_normalizer
     if destination_capabilities and destination_capabilities.max_table_nesting is not None:
         # TODO: this is a hack, we need a better method to do this
@@ -113,7 +120,7 @@ def import_normalizers(
             # not a right normalizer
             logger.warning(f"JSON Normalizer {item_normalizer} does not support max_nesting")
             pass
-    json_module = cast(SupportsDataItemNormalizer, import_module(item_normalizer["module"]))
+    json_module = cast(SupportsDataItemNormalizer, import_module(json_module_name))
     explicit_normalizers["json"] = item_normalizer
     return (
         explicit_normalizers,
