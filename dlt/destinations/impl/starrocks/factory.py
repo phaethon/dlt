@@ -77,6 +77,7 @@ class starrocks(sqlalchemy):
         destination_name: Optional[str] = None,
         environment: Optional[str] = None,
         engine_args: Optional[Dict[str, Any]] = None,
+        engine_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -84,6 +85,7 @@ class starrocks(sqlalchemy):
             destination_name=destination_name,
             environment=environment,
             engine_args=engine_args,
+            engine_kwargs=engine_kwargs,
             **kwargs,
         )
     def _raw_capabilities(self) -> DestinationCapabilitiesContext:
