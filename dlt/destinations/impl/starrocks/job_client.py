@@ -83,15 +83,12 @@ class StarrocksObjectStorageLoadJob(CopyRemoteFileLoadJob):
 
             aws_connection_details = ',\n'.join([ f'"{i}" = "{connection_dict[i]}"'  for i in connection_dict ])
 
-            column_list = ', '.join([f'`{col.name}`' for col in self.table.columns])
-
             stmt = f'''
                     INSERT INTO {self._job_client.sql_client.dataset_name}.{self.table.name} BY NAME
-                    (SELECT {column_list} FROM FILES (
+                    (SELECT * FROM FILES (
                         {aws_connection_details}
                     ))
                     '''
-            # logger.info(stmt)
 
             with _sql_client.begin_transaction():
                 logger.info('Starrocks: query INSERT INTO ... FROM FILES')
