@@ -11,13 +11,16 @@ from typing import (
     Set,
     Protocol,
     Type,
+    TYPE_CHECKING,
 )
+
+if TYPE_CHECKING:
+    import sqlglot.expressions as sge
 from dlt.common.libs.sqlglot import TSqlGlotDialect
 from dlt.common.destination.configuration import ParquetFormatConfiguration
 from dlt.common.exceptions import TerminalValueError
 from dlt.common.normalizers.typing import TNamingConventionReferenceArg
 from dlt.common.typing import TLoaderFileFormat, get_args
-from dlt.common.configuration.utils import serialize_value
 from dlt.common.configuration import configspec
 from dlt.common.configuration.specs import ContainerInjectableContext
 from dlt.common.destination.exceptions import (
@@ -26,6 +29,7 @@ from dlt.common.destination.exceptions import (
     DestinationLoadingWithoutStagingNotSupported,
 )
 from dlt.common.destination.typing import PreparedTableSchema
+from dlt.common.time import DEFAULT_TIMESTAMP_PRECISION
 from dlt.common.arithmetics import DEFAULT_NUMERIC_PRECISION, DEFAULT_NUMERIC_SCALE
 from dlt.common.schema.typing import (
     TColumnSchema,
@@ -130,6 +134,7 @@ class UnsupportedTypeMapper(DataTypeMapper):
 
 
 TCasefoldIdentifier = Callable[[str], str]
+TNullSafeAggregate = Callable[["sge.AggFunc"], "sge.Expression"]
 
 
 @configspec
@@ -157,6 +162,8 @@ class DestinationCapabilitiesContext(ContainerInjectableContext):
     "Escapes string literal"
     casefold_identifier: TCasefoldIdentifier = str
     """Casing function applied by destination to represent case insensitive identifiers."""
+    null_safe_aggregate: Optional[TNullSafeAggregate] = None
+    """Wraps an aggregate so that an empty input yields `NULL`."""
     has_case_sensitive_identifiers: bool = None
     """Tells if destination supports case sensitive identifiers"""
     decimal_precision: Tuple[int, int] = None
@@ -175,10 +182,14 @@ class DestinationCapabilitiesContext(ContainerInjectableContext):
     supports_create_table_if_not_exists: bool = True
     supports_truncate_command: bool = True
     schema_supports_numeric_precision: bool = True
-    timestamp_precision: int = 6
+    timestamp_precision: int = DEFAULT_TIMESTAMP_PRECISION
     """Default precision of the timestamp type"""
-    max_timestamp_precision: int = 6
+    max_timestamp_precision: int = DEFAULT_TIMESTAMP_PRECISION
     """Maximum supported timestamp precision"""
+    supports_timestamp_precision_configuration: bool = True
+    """Whether destination supports configuring precision of its timestamp type."""
+    supports_binary_precision_configuration: bool = True
+    """Whether destination supports configuring precision of its binary type."""
 
     max_rows_per_insert: Optional[int] = None
     insert_values_writer_type: str = "default"
@@ -226,6 +237,9 @@ class DestinationCapabilitiesContext(ContainerInjectableContext):
     supports_naive_datetime: bool = True
     """The destination can store datetime without timezone"""
 
+    supports_session_timezone: bool = False
+    """The destination can set the timezone of the connected session"""
+
     dialect_capabilities: Optional[Any] = None
     """Capabilities of selected dialect for multi-dialect destinations ie. SQLAlchemy"""
 
@@ -243,7 +257,7 @@ class DestinationCapabilitiesContext(ContainerInjectableContext):
         supported_merge_strategies: Sequence[TLoaderMergeStrategy] = None,
         merge_strategies_selector: MergeStrategySelector = None,
     ) -> "DestinationCapabilitiesContext":
-        from dlt.common.data_writers.escape import format_datetime_literal
+        from dlt.common.data_writers.escape import escape_ansi_literal, format_datetime_literal
 
         caps = DestinationCapabilitiesContext()
         caps.preferred_loader_file_format = preferred_loader_file_format
@@ -254,7 +268,7 @@ class DestinationCapabilitiesContext(ContainerInjectableContext):
         caps.naming_convention = naming_convention or caps.naming_convention
         caps.escape_identifier = str
         caps.supported_table_formats = supported_table_formats or []
-        caps.escape_literal = serialize_value
+        caps.escape_literal = escape_ansi_literal
         caps.casefold_identifier = str
         caps.has_case_sensitive_identifiers = True
         caps.format_datetime_literal = format_datetime_literal

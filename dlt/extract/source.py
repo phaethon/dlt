@@ -3,6 +3,7 @@ from copy import copy
 from functools import partial
 import inspect
 from typing import (
+    TYPE_CHECKING,
     ClassVar,
     Dict,
     Iterable,
@@ -24,7 +25,6 @@ from dlt.common.normalizers.json.relational import DataItemNormalizer as Relatio
 from dlt.common.normalizers.json.typing import RelationalNormalizerConfig
 from dlt.common.schema import Schema
 from dlt.common.schema.typing import TColumnName, TSchemaContract
-from dlt.common.schema.utils import normalize_table_identifiers
 from dlt.common.typing import StrAny, TDataItem
 from dlt.common.configuration.container import Container
 from dlt.common.pipeline import (
@@ -53,6 +53,10 @@ from dlt.extract.exceptions import (
     DeletingResourcesNotSupported,
     InvalidParallelResourceDataType,
 )
+
+
+if TYPE_CHECKING:
+    from dlt.extract.reference import SourceFactory
 
 
 class DltResourceDict(Dict[str, DltResource]):
@@ -368,6 +372,7 @@ class DltSource(Iterable[TDataItem]):
         """Tells if iterator associated with a source is exhausted"""
         self._schema = schema
         self._resources: DltResourceDict = DltResourceDict(self.name, self.section)
+        self._factory: Optional["SourceFactory[Any, Any]"] = None
 
         if resources:
             self.resources.add(*resources)
@@ -496,13 +501,8 @@ class DltSource(Iterable[TDataItem]):
         for r in self.selected_resources.values():
             # names must be normalized here
             with contextlib.suppress(DataItemRequiredForDynamicTableHints):
-                root_table_schema = r.compute_table_schema(item, meta)
-                nested_tables_schema = r.compute_nested_table_schemas(
-                    root_table_schema["name"], schema.naming, item, meta
-                )
                 # NOTE must ensure that `schema.update_table()` is called in an order that respect parent-child relationships
-                for table_schema in (root_table_schema, *nested_tables_schema):
-                    partial_table = normalize_table_identifiers(table_schema, self._schema.naming)
+                for partial_table in r.compute_tables(schema.naming, item, meta):
                     schema.update_table(partial_table)
         return schema
 
@@ -535,7 +535,7 @@ class DltSource(Iterable[TDataItem]):
         max_time: Optional[float] = None,
         count_rows: Optional[bool] = False,
     ) -> "DltSource":  # noqa: A003
-        """Limits the items processed in all selected resources in the source that are not transformers: by count or time.
+        """Limits the items processed in all selected resources in the source: by count or time.
 
         This is useful for testing, debugging and generating sample datasets for experimentation. You can easily get your test dataset in a few minutes, when otherwise
         you'd need to wait hours for the full loading to complete.
@@ -544,7 +544,7 @@ class DltSource(Iterable[TDataItem]):
         in batches.
 
         Notes:
-            1. Transformers resources won't be limited. They should process all the data they receive fully to avoid inconsistencies in generated datasets.
+            1. A transformer sets its limit on the resource at the top of its chain, so resources that are not selected but feed selected transformers are limited too. Transformers process all the data they receive.
             2. Each yielded item may contain several records. `add_limit` only limits the "number of yields", not the total number of records.
             3. Empty pages/yields are also counted. Use `count_rows` to skip empty pages.
 
@@ -592,9 +592,11 @@ class DltSource(Iterable[TDataItem]):
         If `with_name` is provided, a schema is cloned with a changed name
         """
         # mind that resources and pipes are cloned when added to the DltResourcesDict in the source constructor
-        return DltSource(
+        source = DltSource(
             self.schema.clone(with_name=with_name), self.section, list(self._resources.values())
         )
+        source._factory = self._factory
+        return source
 
     def __iter__(self) -> Generator[TDataItem, None, None]:
         """Opens iterator that yields the data items from all the resources within the source in the same order as in Pipeline class.

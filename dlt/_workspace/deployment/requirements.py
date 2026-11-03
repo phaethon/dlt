@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, BinaryIO, Dict, List, Optional, Sequence
+from typing import Any, BinaryIO, Dict, Final, List, Optional, Sequence, Set
 
 import tomlkit
 from packaging.requirements import Requirement
@@ -18,20 +18,30 @@ from dlt.common import json
 from dlt.common.exceptions import DictValidationException
 from dlt.common.typing import DictStrAny
 from dlt.common.validation import validate_dict
-from dlt.version import DLT_PKG_NAME
+from dlt.version import DLT_PKG_NAME, get_extra_requirements
+
+DLTHUB_PKG_NAME = "dlthub"
+DLTHUB_CLIENT_PKG_NAME = "dlthub-client"
 
 from dlt._workspace.deployment.launchers import (
+    BUILTIN_AGENT_LOOPS,
+    LAUNCHER_AGENT,
     LAUNCHER_DASHBOARD,
     LAUNCHER_JOB,
     LAUNCHER_MARIMO,
     LAUNCHER_MCP,
     LAUNCHER_MODULE,
     LAUNCHER_STREAMLIT,
+    LOOP_CLAUDE_AGENT_SDK,
+    LOOP_PYDANTIC_AI,
+    agent_loop_group,
 )
 from dlt._workspace.deployment.typing import (
     DASHBOARD_JOB_REF,
     MAIN_GROUP,
     REQUIREMENTS_ENGINE_VERSION,
+    TInstallMode,
+    TInstallSpec,
     TWorkspaceRequirementsManifest,
 )
 
@@ -42,20 +52,32 @@ REQUIREMENTS_IN = "requirements.in"
 UV_LOCK = "uv.lock"
 
 __all__ = [
+    "DLTHUB_CLIENT_PKG_NAME",
+    "DLTHUB_PKG_NAME",
     "MAIN_GROUP",
     "REQUIREMENTS_ENGINE_VERSION",
+    "TInstallSpec",
+    "TInstallMode",
     "TWorkspaceRequirementsManifest",
     "WorkspaceRequirementsError",
     "build_dashboard_group",
     "build_launcher_requirements",
     "default_requirements_manifest",
+    "dlt_extra_specs",
     "export_workspace_requirements",
+    "floored_spec",
     "get_dlt_requirement_spec",
+    "get_pkg_install_spec",
+    "get_workspace_install_specs",
     "load_requirements",
     "migrate_requirements",
     "python_version",
+    "render_pep508",
+    "render_requirements_lines",
+    "render_uv_source",
     "save_requirements",
 ]
+
 
 _UV_MISSING_MESSAGE = (
     "`uv` is required to export dependencies from this workspace but was not found"
@@ -77,22 +99,143 @@ class WorkspaceRequirementsError(Exception):
 
 
 def get_dlt_requirement_spec() -> str:
-    """Build a PEP 508 spec for the currently installed dlt distribution.
+    """PEP 508 spec for the currently installed dlt distribution, deployment-mode."""
+    return render_pep508(get_pkg_install_spec(DLT_PKG_NAME), for_deployment=True)
 
-    Uses PEP 610 `direct_url.json` when dlt was installed from a URL (branch
-    zip, git) so the spec survives on a remote runner; falls back to a
-    `dlt==<version>` pin for ordinary index installs.
-    """
-    dist = importlib.metadata.distribution(DLT_PKG_NAME)
+
+def get_pkg_install_spec(pkg_name: str, *, extras: Optional[List[str]] = None) -> TInstallSpec:
+    """Classify the install of `pkg_name` as pypi / path / editable / git."""
+    # raises importlib.metadata.PackageNotFoundError if the package isn't installed
+    dist = importlib.metadata.distribution(pkg_name)
+    version = dist.metadata["Version"] or ""
+    spec: TInstallSpec = {
+        "name": pkg_name,
+        "extras": list(extras or []),
+        "version": version,
+        "mode": "pypi",
+    }
     direct_url_text = dist.read_text("direct_url.json")
-    if direct_url_text:
-        info = json.loads(direct_url_text)
-        # editable local installs (`file://` + `dir_info.editable=True`) can't
-        # be resolved on a remote runner — fall back to a version pin in that case
-        dir_info = info.get("dir_info") or {}
-        if not dir_info.get("editable"):
-            return f"{DLT_PKG_NAME} @ {info['url']}"
-    return f"{DLT_PKG_NAME}=={dist.metadata['Version']}"
+    if not direct_url_text:
+        return spec
+    info = json.loads(direct_url_text)
+    url = info.get("url") or ""
+    vcs_info = info.get("vcs_info") or {}
+    dir_info = info.get("dir_info") or {}
+
+    if vcs_info.get("vcs") == "git":
+        spec["mode"] = "git"
+        spec["git_url"] = url
+        commit = vcs_info.get("commit_id")
+        if commit:
+            spec["git_rev"] = commit
+        return spec
+
+    # both editable and plain local installs use file:// URIs
+    if url.startswith("file://"):
+        spec["mode"] = "editable" if dir_info.get("editable") else "path"
+        spec["path"] = url[len("file://") :]
+        return spec
+
+    # http(s) archive — `pip install https://.../pkg.zip` (incl. github archive URLs)
+    if info.get("archive_info") is not None or url.startswith(("http://", "https://")):
+        spec["mode"] = "archive"
+        spec["archive_url"] = url
+        return spec
+
+    # unknown direct_url variant — fall back to pypi version pin
+    return spec
+
+
+def _name_with_extras(spec: TInstallSpec) -> str:
+    if not spec["extras"]:
+        return spec["name"]
+    return f"{spec['name']}[{','.join(spec['extras'])}]"
+
+
+def render_pep508(spec: TInstallSpec, *, for_deployment: bool) -> str:
+    """PEP 508 line for `[project.dependencies]` / top-of-`requirements.txt`.
+
+    Args:
+        spec: Install spec to render.
+        for_deployment: When True, render a portable line (editable becomes a
+            version pin; path/git become PEP 508 direct refs). When False (used
+            for scaffolding), emit a version pin so `[tool.uv.sources]` can carry
+            the override.
+    """
+    name_extras = _name_with_extras(spec)
+    mode = spec["mode"]
+    version = spec["version"]
+    if mode == "pypi":
+        return f"{name_extras}=={version}" if version else name_extras
+    if mode == "editable":
+        # editable can't be expressed in PEP 508 — both modes fall back to the pin
+        return f"{name_extras}=={version}" if version else name_extras
+    if mode == "path":
+        if for_deployment:
+            return f"{name_extras} @ file://{spec['path']}"
+        return f"{name_extras}=={version}" if version else name_extras
+    if mode == "archive":
+        # PEP 508 direct ref; portable to pip + uv with no source-override needed
+        return f"{name_extras} @ {spec['archive_url']}"
+    # git
+    git_url = spec.get("git_url", "")
+    git_rev = spec.get("git_rev")
+    if for_deployment or not version:
+        ref = f"git+{git_url}@{git_rev}" if git_rev else f"git+{git_url}"
+        return f"{name_extras} @ {ref}"
+    return f"{name_extras}=={version}"
+
+
+def render_uv_source(spec: TInstallSpec) -> Optional[Dict[str, Any]]:
+    """`[tool.uv.sources][<name>]` value, or `None` when a direct ref in deps suffices."""
+    # archives carry the URL inline in `dependencies` (PEP 508 direct ref) — no override
+    mode = spec["mode"]
+    if mode in ("pypi", "archive"):
+        return None
+    if mode == "path":
+        return {"path": spec["path"]}
+    if mode == "editable":
+        return {"path": spec["path"], "editable": True}
+    # git
+    out: Dict[str, Any] = {"git": spec.get("git_url", "")}
+    rev = spec.get("git_rev")
+    if rev:
+        out["rev"] = rev
+    return out
+
+
+def render_requirements_lines(spec: TInstallSpec) -> List[str]:
+    """Lines for `requirements.txt` reproducing `spec`. Editable becomes `-e <path>`."""
+    name_extras = _name_with_extras(spec)
+    mode = spec["mode"]
+    version = spec["version"]
+    if mode == "pypi":
+        return [f"{name_extras}=={version}"] if version else [name_extras]
+    if mode == "editable":
+        return [f"-e {spec['path']}"]
+    if mode == "path":
+        return [f"{name_extras} @ file://{spec['path']}"]
+    if mode == "archive":
+        return [f"{name_extras} @ {spec['archive_url']}"]
+    # git
+    git_url = spec.get("git_url", "")
+    git_rev = spec.get("git_rev")
+    ref = f"git+{git_url}@{git_rev}" if git_rev else f"git+{git_url}"
+    return [f"{name_extras} @ {ref}"]
+
+
+def get_workspace_install_specs() -> List[TInstallSpec]:
+    """Specs for `dlt[hub]` + `dlthub` + `dlthub-client`, skipping ones not installed."""
+    # dlt is always present (it's how this code is running) and tagged with [hub] so
+    # the scaffold's transitive resolution pulls dlthub / dlthub-client. The other two
+    # are only listed when locally installed — that's the signal we need an override.
+    specs: List[TInstallSpec] = [get_pkg_install_spec(DLT_PKG_NAME, extras=["hub"])]
+    for pkg in (DLTHUB_PKG_NAME, DLTHUB_CLIENT_PKG_NAME):
+        try:
+            specs.append(get_pkg_install_spec(pkg))
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    return specs
 
 
 def python_version() -> str:
@@ -100,40 +243,89 @@ def python_version() -> str:
     return f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
-_BASE_LAUNCHER_SPECS: List[str] = ["croniter", "dlthub"]
-"""Specs added to every launcher group and the dashboard group."""
+def dlt_extra_specs(extra: str) -> Dict[str, str]:
+    """Specs of the installed dlt's `extra` by package name, with dlt's own bounds.
+
+    Raises:
+        WorkspaceRequirementsError: The installed dlt declares nothing under `extra`.
+    """
+    specs = {name: str(req) for name, req in get_extra_requirements(extra).items()}
+    if not specs:
+        raise WorkspaceRequirementsError(f"installed {DLT_PKG_NAME} declares no `{extra}` extra")
+    return specs
+
+
+# every launcher gets dlthub through dlt's hub extra, so it follows whichever dlt resolves. as a
+# direct spec dlt's `dlthub>=0.30.0a1` floor would make uv install dlthub prereleases
+_HUB_SPEC = f"{DLT_PKG_NAME}[hub]"
+
+# relaxed floors: rarely conflicting with a workspace's pins, never resolving ancient releases
+_FLOORS: Final[Dict[str, str]] = {
+    # 0.2.126 is the first release whose ResultMessage carries terminal_reason
+    "claude-agent-sdk": ">=0.2.126",
+    "fastmcp": ">=3.1.0",
+    "ibis-framework": ">=12.0.0",
+    "marimo": ">=0.14.5",
+    # 2.33.0 is the first release that supports anthropic 1.x, which any resolve picks today
+    "pydantic-ai-slim": ">=2.33.0",
+    "streamlit": ">=1.50.0",
+    "uvicorn": ">=0.46.0",
+}
+
+
+def floored_spec(name: str, *, extras: Sequence[str] = ()) -> str:
+    """PEP 508 spec for `name` with its relaxed floor."""
+    extras_part = f"[{','.join(extras)}]" if extras else ""
+    return f"{name}{extras_part}{_FLOORS[name]}"
 
 
 def build_launcher_requirements() -> Dict[str, List[str]]:
     """Per-launcher mandatory specs. dlt is injected separately at build time."""
+    s3 = list(dlt_extra_specs("s3").values())
     per_launcher: Dict[str, List[str]] = {
-        LAUNCHER_JOB: ["botocore", "s3fs"],
-        LAUNCHER_MODULE: ["botocore", "s3fs"],
-        LAUNCHER_MARIMO: ["marimo", "uvicorn"],
-        LAUNCHER_MCP: ["fastmcp", "uvicorn"],
-        LAUNCHER_STREAMLIT: ["streamlit"],
+        LAUNCHER_JOB: s3,
+        LAUNCHER_MODULE: s3,
+        # loop packages are per-job, so they live in `agent-loop-*` groups instead
+        LAUNCHER_AGENT: s3,
+        LAUNCHER_MARIMO: [floored_spec("marimo"), floored_spec("uvicorn")],
+        LAUNCHER_MCP: [floored_spec("fastmcp"), floored_spec("uvicorn")],
+        LAUNCHER_STREAMLIT: [floored_spec("streamlit")],
         LAUNCHER_DASHBOARD: [],
     }
-    return {k: sorted(set(v + _BASE_LAUNCHER_SPECS)) for k, v in per_launcher.items()}
+    return {k: sorted(set(v + [_HUB_SPEC])) for k, v in per_launcher.items()}
 
 
 def build_dashboard_group() -> List[str]:
-    """Specs for the `DASHBOARD_JOB_REF` group."""
+    """Specs for the `DASHBOARD_JOB_REF` group.
+
+    Matches the packages the dashboard runner requires plus dlt's `s3` extra for artifact
+    access; the launcher baseline (dlthub, dlt) comes from `launcher_requirements`.
+    """
     return sorted(
-        set(
-            _BASE_LAUNCHER_SPECS
-            + [
-                "botocore",
-                "ibis-framework",
-                "marimo",
-                "numpy",
-                "pandas",
-                "pyarrow",
-                "s3fs",
-                "uvicorn",
-            ]
-        )
+        [floored_spec("ibis-framework"), floored_spec("marimo")]
+        + list(dlt_extra_specs("parquet").values())
+        + list(dlt_extra_specs("s3").values())
     )
+
+
+def build_agent_loop_groups() -> Dict[str, List[str]]:
+    """Specs for each built-in agent loop, keyed by its requirements group name."""
+    loop_specs: Dict[str, List[str]] = {
+        LOOP_PYDANTIC_AI: [
+            floored_spec(
+                "pydantic-ai-slim", extras=["anthropic", "openai", "google", "mcp", "spec"]
+            )
+        ],
+        LOOP_CLAUDE_AGENT_SDK: [floored_spec("claude-agent-sdk")],
+    }
+    return {agent_loop_group(loop): sorted(loop_specs[loop]) for loop in BUILTIN_AGENT_LOOPS}
+
+
+def _add_agent_loop_groups(groups: Dict[str, List[str]], default_names: Set[str]) -> None:
+    """Adds the built-in loop groups, leaving a group the workspace already declares alone."""
+    for name, specs in build_agent_loop_groups().items():
+        if name not in groups:
+            groups[name] = _prune_specs(specs, default_names)
 
 
 def _inject_dlt_into_launchers(launcher_requirements: Dict[str, List[str]]) -> None:
@@ -143,14 +335,17 @@ def _inject_dlt_into_launchers(launcher_requirements: Dict[str, List[str]]) -> N
 
 
 def default_requirements_manifest() -> TWorkspaceRequirementsManifest:
-    """Minimal manifest: empty `main`, dashboard group, launcher specs with dlt injected."""
+    """Minimal manifest: empty `main`, dashboard and agent loop groups, launcher specs with dlt."""
     launcher_requirements = build_launcher_requirements()
     _inject_dlt_into_launchers(launcher_requirements)
+    groups: Dict[str, List[str]] = {MAIN_GROUP: [], DASHBOARD_JOB_REF: build_dashboard_group()}
+    groups.update(build_agent_loop_groups())
     return {
         "engine_version": REQUIREMENTS_ENGINE_VERSION,
         "python_version": python_version(),
+        "dlt_version": get_pkg_install_spec(DLT_PKG_NAME),
         "default_groups": [MAIN_GROUP],
-        "groups": {MAIN_GROUP: [], DASHBOARD_JOB_REF: build_dashboard_group()},
+        "groups": groups,
         "launcher_requirements": launcher_requirements,
     }
 
@@ -190,34 +385,56 @@ def export_workspace_requirements(
     else:
         groups = {MAIN_GROUP: []}
 
-    groups[DASHBOARD_JOB_REF] = build_dashboard_group()
-
     resolved_default_groups = list(default_groups) if default_groups else [MAIN_GROUP]
+    # names installed by default groups — always present at runtime, safe to prune against
+    default_names: Set[str] = set()
+    for name in resolved_default_groups:
+        default_names.update(_collect_package_names(groups.get(name, [])))
+    _add_transitive_names(default_names)
+
+    groups[DASHBOARD_JOB_REF] = _prune_specs(build_dashboard_group(), default_names)
+    _add_agent_loop_groups(groups, default_names)
 
     launcher_requirements = build_launcher_requirements()
+    for launcher, specs in launcher_requirements.items():
+        launcher_requirements[launcher] = _prune_specs(specs, default_names)
     # inject dlt into every launcher entry unless a default group already names it
-    default_has_dlt = any(
-        _contains_package(groups.get(name, []), DLT_PKG_NAME) for name in resolved_default_groups
-    )
-    if not default_has_dlt:
+    if _normalize_name(DLT_PKG_NAME) not in default_names:
         _inject_dlt_into_launchers(launcher_requirements)
 
     return {
         "engine_version": REQUIREMENTS_ENGINE_VERSION,
         "python_version": python_version(),
+        "dlt_version": get_pkg_install_spec(DLT_PKG_NAME),
         "default_groups": resolved_default_groups,
         "groups": dict(sorted(groups.items())),
         "launcher_requirements": launcher_requirements,
     }
 
 
+PRE_TRACKING_DLT_INSTALL_SPEC: TInstallSpec = {
+    "name": DLT_PKG_NAME,
+    "extras": [],
+    "version": "1.28.0",
+    "mode": "pypi",
+}
+"""dlt install assumed for engine-1 manifests, which predate dlt-version tracking."""
+
+
 def migrate_requirements(
     manifest_dict: DictStrAny, from_engine: int, to_engine: int
 ) -> TWorkspaceRequirementsManifest:
-    """Migrate a requirements manifest dict between engine versions."""
+    """Migrate a requirements manifest dict between engine versions, in place."""
     if from_engine == to_engine:
         return manifest_dict  # type: ignore[return-value]
-    raise ValueError(f"no requirements migration path from engine {from_engine} to {to_engine}")
+    if from_engine == 1 and to_engine > 1:
+        # engine 2 adds dlt_version; engine-1 manifests predate it, assume 1.28.0
+        manifest_dict.setdefault("dlt_version", dict(PRE_TRACKING_DLT_INSTALL_SPEC))
+        from_engine = 2
+    if from_engine != to_engine:
+        raise ValueError(f"no requirements migration path from engine {from_engine} to {to_engine}")
+    manifest_dict["engine_version"] = to_engine
+    return manifest_dict  # type: ignore[return-value]
 
 
 def save_requirements(req: TWorkspaceRequirementsManifest, f: BinaryIO) -> None:
@@ -301,14 +518,10 @@ def _export_from_pyproject(
 
 
 def _compile_requirements_file(workspace_root: Path, file_path: Path) -> List[str]:
-    """Export a `requirements.txt` / `requirements.in` file as sorted PEP 508 specs.
-
-    When `uv` is available, runs `uv pip compile --universal` for a fully
-    resolved, platform-independent lockset. When `uv` is missing, falls back
-    to a pure-Python parse of the file — no resolution, specs are returned
-    as authored.
-    """
-    if _is_uv_available():
+    """Export a `requirements.txt` / `requirements.in` file as sorted PEP 508 specs."""
+    # with uv: `uv pip compile --universal` for a resolved, platform-independent
+    # lockset. without uv: pure-Python parse, specs returned as authored
+    if is_uv_available():
         stdout = _run_uv(
             [
                 "pip",
@@ -325,12 +538,8 @@ def _compile_requirements_file(workspace_root: Path, file_path: Path) -> List[st
 
 
 def _parse_requirements_file(file_path: Path) -> List[str]:
-    """Parse a user-authored `requirements.txt` / `.in` file to sorted PEP 508 specs.
-
-    Handles comments, blank lines, line continuations, and skips flag lines
-    (`-e`, `-r`, `--index-url`, ...). Does **not** resolve — returns specs
-    as authored, normalized through `packaging.requirements.Requirement`.
-    """
+    """Parse a user-authored `requirements.txt` / `.in` file to sorted PEP 508 specs."""
+    # does not resolve; flag lines (-e, -r, --index-url) are skipped
     text = file_path.read_text(encoding="utf-8")
     # join line continuations
     text = text.replace("\\\n", "")
@@ -362,13 +571,9 @@ def _dependency_group_names(pyproject_doc: Any) -> List[str]:
 
 
 def _parse_uv_output(text: str) -> List[str]:
-    """Deduplicate and sort the lines of a `uv export` / `uv pip compile` blob.
-
-    We pass `--no-header --no-annotate --no-hashes` / equivalent flags so uv's
-    output is already canonical PEP 508 — one spec per line, no flags, no
-    continuations. We only need to drop blanks/comments and return a stable
-    sorted set.
-    """
+    """Deduplicate and sort the lines of a `uv export` / `uv pip compile` blob."""
+    # callers always pass --no-header --no-annotate --no-hashes (or equivalent),
+    # so the input is already canonical PEP 508 — just drop blanks/comments
     return sorted(
         {
             line.strip()
@@ -378,8 +583,11 @@ def _parse_uv_output(text: str) -> List[str]:
     )
 
 
-# PEP 508 leading identifier: first letter/digit then letters/digits/_/-/.
-_LEADING_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9_.\-]*)")
+# PEP 508 leading identifier with optional extras. a regex rather than Requirement() because a
+# resolved export carries hundreds of specs and full parsing is ~45x slower
+_LEADING_NAME_RE = re.compile(
+    r"^\s*(?P<name>[A-Za-z0-9][A-Za-z0-9_.\-]*)\s*(?:\[(?P<extras>[^\]]*)\])?"
+)
 # PEP 503 normalization: lowercase, runs of `-_.` collapsed to single `-`
 _PEP503_SEP_RE = re.compile(r"[-_.]+")
 
@@ -388,14 +596,54 @@ def _normalize_name(name: str) -> str:
     return _PEP503_SEP_RE.sub("-", name.lower())
 
 
-def _contains_package(specs: Sequence[str], pkg_name: str) -> bool:
-    """Check whether any PEP 508 spec in `specs` names `pkg_name` (PEP 503 normalized)."""
-    target = _normalize_name(pkg_name)
+# packages a workspace dependency installs on its own, which make our spec for them redundant
+_TRANSITIVE_DEPENDENCIES: Dict[str, List[str]] = {
+    "s3fs": ["botocore"],
+    "pydantic-ai": ["pydantic-ai-slim"],
+    "marimo": ["uvicorn"],
+    "fastmcp": ["uvicorn"],
+}
+
+
+def _collect_package_names(specs: Sequence[str]) -> Set[str]:
+    """PEP 503 normalized names of `specs`, plus a `name[extra]` entry per declared extra."""
+    names: Set[str] = set()
     for s in specs:
         m = _LEADING_NAME_RE.match(s)
-        if m and _normalize_name(m.group(1)) == target:
-            return True
-    return False
+        if not m:
+            continue
+        name = _normalize_name(m.group("name"))
+        names.add(name)
+        for extra in (m.group("extras") or "").split(","):
+            if extra.strip():
+                names.add(f"{name}[{_normalize_name(extra.strip())}]")
+    return names
+
+
+def _add_transitive_names(names: Set[str]) -> None:
+    """Adds the names that packages in `names` install on their own."""
+    # a resolved export already lists the packages of a dlt extra, a declared `dlt[extra]` does not
+    extra_prefix = f"{DLT_PKG_NAME}["
+    for entry in [n for n in names if n.startswith(extra_prefix)]:
+        names.update(get_extra_requirements(entry[len(extra_prefix) : -1]))
+    for name, transitive in _TRANSITIVE_DEPENDENCIES.items():
+        if name in names:
+            names.update(transitive)
+
+
+def _prune_specs(specs: List[str], names: Set[str]) -> List[str]:
+    """Drop specs whose PEP 503 normalized name is in `names`, preserving order."""
+    pruned: List[str] = []
+    for s in specs:
+        if s == _HUB_SPEC:
+            # a workspace dlthub at any version wins, dlt[hub] would walk dlt back to match it
+            if DLTHUB_PKG_NAME not in names:
+                pruned.append(s)
+            continue
+        m = _LEADING_NAME_RE.match(s)
+        if m is None or _normalize_name(m.group("name")) not in names:
+            pruned.append(s)
+    return pruned
 
 
 def _parse_dep_list(entries: Sequence[Any]) -> List[str]:
@@ -419,23 +667,19 @@ def _parse_dep_list(entries: Sequence[Any]) -> List[str]:
     return sorted(set(specs))
 
 
-def _is_uv_available() -> bool:
+def is_uv_available() -> bool:
     """Return `True` if the `uv` binary is on PATH."""
     return shutil.which("uv") is not None
 
 
 def _require_uv() -> None:
     """Raise a user-friendly `WorkspaceRequirementsError` when `uv` is missing."""
-    if not _is_uv_available():
+    if not is_uv_available():
         raise WorkspaceRequirementsError(_UV_MISSING_MESSAGE)
 
 
 def _run_uv(args: List[str], cwd: Path) -> str:
-    """Invoke `uv` with the given args, returning stdout on success.
-
-    Callers are expected to have checked `_is_uv_available()` first; the
-    `FileNotFoundError` branch is a last-resort safety net.
-    """
+    """Invoke `uv` with the given args, returning stdout on success."""
     try:
         proc = subprocess.run(
             ["uv", *args],

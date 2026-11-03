@@ -1,6 +1,8 @@
 import re
 import sys
-from typing import Any, Dict, Type, Union, TYPE_CHECKING, Optional, cast
+from typing import Any, Dict, Sequence, Type, Union, TYPE_CHECKING, Optional, cast
+
+import sqlglot.expressions as sge
 
 from dlt.common import logger
 from dlt.common.arithmetics import DEFAULT_NUMERIC_PRECISION, DEFAULT_NUMERIC_SCALE
@@ -22,6 +24,8 @@ from dlt.destinations.impl.clickhouse.configuration import (
 
 
 if TYPE_CHECKING:
+    from dlt.common.libs.ibis import BaseBackend
+    from dlt.common.schema import Schema
     from dlt.destinations.impl.clickhouse.clickhouse import ClickHouseClient
     from clickhouse_driver.dbapi import Connection  # type: ignore[import-untyped]
 else:
@@ -159,11 +163,27 @@ class ClickHouseTypeMapper(TypeMapperImpl):
         )
 
 
+def _clickhouse_null_safe_aggregate(agg: sge.AggFunc) -> sge.Expression:
+    """Rewrite `MAX`/`MIN` to the `*OrNull` combinator.
+
+    ClickHouse aggregates over an empty set return the column type's default
+    sentinel (epoch for non-`Nullable(DateTime)`, `0` for non-`Nullable`
+    integers), not `NULL`. The `*OrNull` combinator widens the result to
+    `Nullable(T)` so the empty case yields `NULL`, matching standard SQL.
+    """
+    if isinstance(agg, sge.Max):
+        return sge.func("maxOrNull", agg.this)
+    if isinstance(agg, sge.Min):
+        return sge.func("minOrNull", agg.this)
+    return agg
+
+
 class clickhouse(Destination[ClickHouseClientConfiguration, "ClickHouseClient"]):
     spec = ClickHouseClientConfiguration
 
     def _raw_capabilities(self) -> DestinationCapabilitiesContext:
         caps = DestinationCapabilitiesContext()
+        caps.supports_session_timezone = True
         caps.preferred_loader_file_format = "jsonl"
         caps.supported_loader_file_formats = ["parquet", "jsonl", "model"]
         caps.preferred_staging_file_format = "jsonl"
@@ -173,6 +193,7 @@ class clickhouse(Destination[ClickHouseClientConfiguration, "ClickHouseClient"])
         caps.format_datetime_literal = format_clickhouse_datetime_literal
         caps.escape_identifier = escape_clickhouse_identifier
         caps.escape_literal = escape_clickhouse_literal
+        caps.null_safe_aggregate = _clickhouse_null_safe_aggregate
         # docs are very unclear https://clickhouse.com/docs/en/sql-reference/syntax
         # taking into account other sources: identifiers are case sensitive
         caps.has_case_sensitive_identifiers = True
@@ -208,7 +229,11 @@ class clickhouse(Destination[ClickHouseClientConfiguration, "ClickHouseClient"])
         caps.supports_truncate_command = True
 
         caps.supported_merge_strategies = ["delete-insert", "scd2"]
-        caps.supported_replace_strategies = ["truncate-and-insert", "insert-from-staging"]
+        caps.supported_replace_strategies = [
+            "truncate-and-insert",
+            "insert-from-staging",
+            "staging-optimized",
+        ]
         caps.enforces_nulls_on_alter = False
 
         caps.sqlglot_dialect = "clickhouse"
@@ -222,6 +247,22 @@ class clickhouse(Destination[ClickHouseClientConfiguration, "ClickHouseClient"])
         from dlt.destinations.impl.clickhouse.clickhouse import ClickHouseClient
 
         return ClickHouseClient
+
+    def create_ibis_backend(
+        self, client: "ClickHouseClient", read_only: bool = False, schemas: "Sequence[Schema]" = ()
+    ) -> "BaseBackend":
+        """Create an ibis clickhouse backend for the client's dataset."""
+        from dlt.helpers.ibis import ibis
+
+        credentials = client.config.credentials
+        return ibis.clickhouse.connect(
+            host=credentials.host,
+            port=credentials.http_port,
+            database=credentials.database,
+            user=credentials.username,
+            password=credentials.password,
+            secure=bool(credentials.secure),
+        )
 
     def __init__(
         self,

@@ -90,8 +90,9 @@ def ensure_remote_head(
     Raises:
         RepositoryDirtyError: If repository has uncommitted changes or is
             not synced with origin.
+        GitError: If path is set and the repository was not cloned sparse.
     """
-    from git import Repo, RepositoryDirtyError
+    from git import GitError, Repo, RepositoryDirtyError
 
     # update remotes and check if heads are same. ignores locally modified files
     with Repo(repo_path) as repo:
@@ -99,7 +100,9 @@ def ensure_remote_head(
         with repo.git.custom_environment(GIT_SSH_COMMAND=with_git_command):
             # if path is set, use sparse checkout
             if path is not None:
-                # assume that sparse checkout was enabled when cloning
+                # a full clone keeps its whole history: fail so the caller clones it sparse
+                if not repo.config_reader().get_value("core", "sparseCheckout", False):
+                    raise GitError(f"{repo_path} is not a sparse checkout")
                 repo.git.sparse_checkout("set", path)
             # checkout branch before fetching
             repo.git.checkout(branch or get_default_branch(repo))
@@ -121,20 +124,31 @@ def clone_repo(
 
     from git import Repo
 
+    # disable background maintenance / commit-graph writes inside the new repo BEFORE
+    # the initial fetch runs.
+    disable_bg_writes = [
+        "--config=gc.auto=0",
+        "--config=maintenance.auto=false",
+        "--config=gc.writeCommitGraph=false",
+        "--config=fetch.writeCommitGraph=false",
+    ]
     if path is not None:
         # set of options that prevents downloading all blobs
         multi_options = [
             "--depth=1",
             "--filter=blob:none",
             "--no-checkout",
+            *disable_bg_writes,
         ]
     else:
-        multi_options = None
+        multi_options = list(disable_bg_writes)
     repo = Repo.clone_from(
         repository_url,
         clone_path,
         env=dict(GIT_SSH_COMMAND=with_git_command),
         multi_options=multi_options,
+        # allow for --config options
+        allow_unsafe_options=True,
     )
     # set up sparse mode to checkout paths on demand
     if path is not None:
@@ -216,7 +230,7 @@ def get_fresh_repo_files(
 
     url = giturlparse.parse(repo_location, check_domain=False)
     if not url.valid:
-        # repo is a directory so jus return storage
+        # repo is a directory so just return storage
         return FileStorage(repo_location, makedirs=False)
     else:
         # clone or update repo

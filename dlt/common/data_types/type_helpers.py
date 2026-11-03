@@ -14,7 +14,9 @@ from dlt.common.wei import Wei
 from dlt.common.arithmetics import InvalidOperation, Decimal
 from dlt.common.data_types.typing import TDataType
 from dlt.common.time import (
-    ensure_pendulum_datetime_non_utc,
+    datetime_to_timestamp,
+    ensure_datetime_in_tz,
+    ensure_datetime,
     ensure_pendulum_date,
     ensure_pendulum_time,
 )
@@ -97,15 +99,17 @@ def json_to_str(value: Any) -> str:
 def coerce_from_date_types(
     to_type: TDataType, value: datetime.datetime
 ) -> Union[datetime.datetime, datetime.date, datetime.time, int, float, str]:
-    v = ensure_pendulum_datetime_non_utc(value)
+    v = ensure_datetime(value)
     if to_type == "timestamp":
         return v
     if to_type == "text":
         return v.isoformat()
     if to_type == "bigint":
-        return v.int_timestamp
+        # localize first: `timestamp()` would read a naive value in the machine timezone, and
+        # `datetime_to_timestamp` takes naive as UTC rather than as the configured timezone
+        return datetime_to_timestamp(ensure_datetime_in_tz(v))
     if to_type == "double":
-        return v.timestamp()
+        return ensure_datetime_in_tz(v).timestamp()
     if to_type == "date":
         return ensure_pendulum_date(v)
     if to_type == "time":
@@ -156,8 +160,24 @@ def _text_to_wei(value: str) -> Wei:
         raise ValueError(trim_value)
 
 
+def _float_to_decimal(value: float) -> Decimal:
+    """Uses `str` that produces most precise stable decimal representation of given `value`"""
+    return Decimal(str(value))
+
+
+def _float_to_wei(value: float) -> Wei:
+    return Wei(str(value))
+
+
 def _numeric_to_bigint(value: Any) -> int:
-    if value % 1 != 0:
+    try:
+        if value % 1 != 0:
+            raise ValueError(value)
+    except InvalidOperation:
+        # A non-finite Decimal/Wei (Infinity, -Infinity) has no integer form,
+        # and `value % 1` raises InvalidOperation rather than returning a
+        # remainder. Surface it as a normal coercion failure, the same way the
+        # text-to-decimal coercers already do.
         raise ValueError(value)
     return int(value)
 
@@ -170,11 +190,11 @@ def _text_fallback(value: Any) -> str:
 
 
 def _text_to_date_fast(value: str) -> PendulumDate:
-    """Fast date parsing: native Python + pendulum Date."""
+    """`ensure_pendulum_date` with an ISO date fast path that skips the datetime round-trip."""
     try:
         d = datetime.date.fromisoformat(value)
         return PendulumDate(d.year, d.month, d.day)
-    except Exception:
+    except ValueError:
         return ensure_pendulum_date(value)
 
 
@@ -206,12 +226,12 @@ _COERCE_DISPATCH: Dict[Tuple[TDataType, TDataType], Callable[[Any], Any]] = {
     # to decimal
     ("decimal", "text"): _text_to_decimal,
     ("decimal", "bigint"): Decimal,
-    ("decimal", "double"): Decimal,
+    ("decimal", "double"): _float_to_decimal,
     ("decimal", "wei"): Decimal,
     # to wei
     ("wei", "text"): _text_to_wei,
     ("wei", "bigint"): Wei,
-    ("wei", "double"): Wei,
+    ("wei", "double"): _float_to_wei,
     ("wei", "decimal"): Wei,
     # to bool
     ("bool", "text"): str2bool,
@@ -222,11 +242,11 @@ _COERCE_DISPATCH: Dict[Tuple[TDataType, TDataType], Callable[[Any], Any]] = {
     # to json
     ("json", "text"): json.loads,
     # to timestamp
-    ("timestamp", "text"): ensure_pendulum_datetime_non_utc,
+    ("timestamp", "text"): ensure_datetime,
     ("timestamp", "bigint"): pendulum.from_timestamp,
     ("timestamp", "double"): pendulum.from_timestamp,
-    ("timestamp", "date"): ensure_pendulum_datetime_non_utc,
-    # to date (fast path)
+    ("timestamp", "date"): ensure_datetime,
+    # to date. `ensure_pendulum_date` is the one place the calendar day is derived
     ("date", "text"): _text_to_date_fast,
     ("date", "timestamp"): ensure_pendulum_date,
     ("date", "bigint"): ensure_pendulum_date,

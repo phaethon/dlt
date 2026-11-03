@@ -22,6 +22,8 @@ secrets.toml
 *.wal
 logs/
 .continuerules
+**/.dlt/data
+**/.dlt/state
 
 # playwright dumps
 test-results/
@@ -164,3 +166,7 @@ compiled_requirements.txt
 
 # docker folder for running tests as other OS
 tests/.docker/
+
+# npm packages pulled in by lint-emscripten
+node_modules/
+.kata.local.toml

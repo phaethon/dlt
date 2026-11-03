@@ -1,8 +1,9 @@
 from collections.abc import Mapping, MutableSequence
 from copy import copy
-from typing import Any, Type
+from typing import Any, Optional, Type, cast
 import pytest
 import datetime  # noqa: I251
+from zoneinfo import ZoneInfo
 from dlt.common.libs.hexbytes import HexBytes
 from enum import Enum
 
@@ -11,8 +12,10 @@ from pendulum.tz import UTC
 from dlt.common import Decimal, Wei, json, pendulum
 from dlt.common.json import _DATETIME, custom_pua_decode_nested
 from dlt.common.data_types import coerce_value, py_type_to_sc_type, TDataType
+from dlt.common.data_types.type_helpers import coerce_from_date_types
 
 from tests.cases import JSON_TYPED_DICT, JSON_TYPED_DICT_TYPES
+from tests.utils import LOCAL_TIMEZONES, local_timezone
 
 
 def test_coerce_same_type() -> None:
@@ -110,6 +113,15 @@ def test_coerce_type_to_bigint() -> None:
     with pytest.raises(ValueError):
         coerce_value("bigint", "wei", Wei(912.12))
 
+    # non-finite decimals/wei have no integer form: they must raise ValueError,
+    # not leak decimal.InvalidOperation
+    with pytest.raises(ValueError):
+        coerce_value("bigint", "decimal", Decimal("Infinity"))
+    with pytest.raises(ValueError):
+        coerce_value("bigint", "decimal", Decimal("-Infinity"))
+    with pytest.raises(ValueError):
+        coerce_value("bigint", "wei", Wei("Infinity"))
+
     # non parsable floats and ints
     with pytest.raises(ValueError):
         coerce_value("bigint", "text", "f912.12")
@@ -138,7 +150,7 @@ def test_coerce_to_numeric(dec_cls: Type[Any], data_type: TDataType) -> None:
     # mind that 1276.37 does not have binary representation as used in float
     v = coerce_value(data_type, "double", 1276.37)
     assert type(v) is dec_cls
-    assert v.quantize(Decimal("1.00")) == dec_cls("1276.37")
+    assert v == dec_cls("1276.37")
 
     # wei to decimal and reverse
     v = coerce_value(data_type, "decimal", Decimal("1276.37"))
@@ -151,6 +163,25 @@ def test_coerce_to_numeric(dec_cls: Type[Any], data_type: TDataType) -> None:
     # invalid format
     with pytest.raises(ValueError):
         coerce_value(data_type, "text", "p912.12")
+
+
+def test_coerce_double_to_decimal_no_float_expansion() -> None:
+    """Decimal(str(float)) should not exhibit IEEE 754 double-precision expansion."""
+    # 34.7 as float would expand to 34.70000000000000284... with Decimal(34.7)
+    # using Decimal(str(34.7)) preserves "34.7"
+    result = coerce_value("decimal", "double", 34.7)
+    assert result == Decimal("34.7")
+    assert str(result) == "34.7"
+
+    # same issue applies to Wei which extends Decimal
+    result = coerce_value("wei", "double", 34.7)
+    assert result == Wei("34.7")
+    assert str(result) == "34.7"
+
+    # get the "binary" float by quantizing properly and avoid casting
+    qd = Decimal.from_float(34.70000000000000284).quantize(Decimal("1." + "0" * 15))
+    # 15 digits scale, round up
+    assert qd == Decimal("34.700000000000003")
 
 
 def test_coerce_type_from_hex_text() -> None:
@@ -307,6 +338,26 @@ def test_coerce_type_to_time() -> None:
     # ISO datetime string fails
     with pytest.raises(ValueError):
         assert coerce_value("time", "text", "2022-05-10T03:41:31.466000+00:00")
+
+
+@pytest.mark.parametrize("local_tz", LOCAL_TIMEZONES)
+def test_coerce_from_date_types_ignores_os_timezone(local_tz: Optional[str]) -> None:
+    """A naive datetime is read as UTC, never in the machine timezone."""
+    naive = datetime.datetime(2024, 1, 15, 23, 30)
+    # the same instant, spelled in three ways
+    utc = naive.replace(tzinfo=datetime.timezone.utc)
+    berlin = utc.astimezone(ZoneInfo("Europe/Berlin"))
+
+    with local_timezone(local_tz):
+        for value in (naive, utc, berlin):
+            assert coerce_from_date_types("bigint", value) == 1705361400
+            assert coerce_from_date_types("double", value) == 1705361400.0
+
+        # branches that do not read a timestamp keep the value as written
+        assert coerce_from_date_types("text", naive) == "2024-01-15T23:30:00"
+        assert coerce_from_date_types("time", naive) == datetime.time(23, 30)
+        assert coerce_from_date_types("date", naive) == datetime.date(2024, 1, 15)
+        assert cast(datetime.datetime, coerce_from_date_types("timestamp", naive)).tzinfo is None
 
 
 def test_coerce_type_to_binary() -> None:

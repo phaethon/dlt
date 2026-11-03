@@ -1,10 +1,37 @@
-from typing import Any, Dict, List, NamedTuple, Type
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Sequence, Tuple, cast
 
 from dlt._workspace.exceptions import WorkspaceException
+
+if TYPE_CHECKING:
+    from dlt._workspace.deployment.typing import TJobDefinition, TJobResult
 
 
 class DeploymentException(WorkspaceException):
     pass
+
+
+class DeploymentValidationError(DeploymentException, ValueError):
+    """Invalid deployment input: manifest, job definition, trigger, job ref or agent definition."""
+
+    def __init__(
+        self,
+        message: str,
+        errors: Optional[Sequence[str]] = None,
+        warnings: Optional[Sequence[str]] = None,
+        subject: Optional[str] = None,
+    ) -> None:
+        self.errors = list(errors) if errors else [message]
+        self.warnings = list(warnings or [])
+        self.subject = subject
+        """What was invalid, when it is one thing: a job ref, a trigger, a path."""
+        super().__init__(message)
+
+    @classmethod
+    def from_message(cls, message: str) -> "DeploymentValidationError":
+        """Rebuilds an instance from its message alone, as a worker process reports it."""
+        exc = cls.__new__(cls)
+        DeploymentValidationError.__init__(exc, message)
+        return exc
 
 
 class JobValidationResult(NamedTuple):
@@ -12,7 +39,15 @@ class JobValidationResult(NamedTuple):
     warnings: List[str]
 
 
-class InvalidJobDefinition(ValueError, DeploymentException):
+class InvalidJobSchema(DeploymentValidationError):
+    def __init__(self, source: str, reason: str) -> None:
+        self.source = source
+        super().__init__(
+            f"Cannot read the schema of {source!r}: {reason}", errors=[reason], subject=source
+        )
+
+
+class InvalidJobDefinition(DeploymentValidationError):
     def __init__(self, job_ref: str, validation: JobValidationResult) -> None:
         self.job_ref = job_ref
         self.validation = validation
@@ -20,7 +55,9 @@ class InvalidJobDefinition(ValueError, DeploymentException):
         msg += "\n".join(f"  - {e}" for e in validation.errors)
         if validation.warnings:
             msg += "\nWarnings:\n" + "\n".join(f"  - {w}" for w in validation.warnings)
-        super().__init__(msg)
+        super().__init__(
+            msg, errors=validation.errors, warnings=validation.warnings, subject=job_ref
+        )
 
 
 class ManifestValidationResult(NamedTuple):
@@ -31,27 +68,39 @@ class ManifestValidationResult(NamedTuple):
     """Maps job_ref -> list of unresolved upstream job refs from triggers."""
 
 
-class InvalidManifest(DeploymentException):
+class InvalidManifest(DeploymentValidationError):
     def __init__(self, validation: ManifestValidationResult) -> None:
         self.validation = validation
         msg = "Invalid deployment manifest:\n" + "\n".join(f"  - {e}" for e in validation.errors)
-        super().__init__(msg)
+        super().__init__(msg, errors=validation.errors, warnings=validation.warnings)
 
     @classmethod
     def from_message(cls, message: str) -> "InvalidManifest":
-        result = ManifestValidationResult(
+        exc = cast("InvalidManifest", super().from_message(message))
+        exc.validation = ManifestValidationResult(
             is_valid=False, errors=[message], warnings=[], unresolved_triggers={}
         )
-        return cls(result)
+        return exc
 
 
-class InvalidJobRef(DeploymentException, ValueError):
+class ManifestEngineNoUpgradePath(DeploymentValidationError):
+    def __init__(self, subject: str, from_engine: int, to_engine: int) -> None:
+        self.from_engine = from_engine
+        self.to_engine = to_engine
+        super().__init__(
+            f"No {subject} migration path from engine {from_engine} to {to_engine}. A manifest"
+            " written by a newer dlt cannot be downgraded — upgrade dlt to read it.",
+            subject=subject,
+        )
+
+
+class InvalidJobRef(DeploymentValidationError):
     def __init__(self, ref: str, reason: str) -> None:
         self.ref = ref
-        super().__init__(f"Invalid job ref {ref!r}: {reason}")
+        super().__init__(f"Invalid job ref {ref!r}: {reason}", errors=[reason], subject=ref)
 
 
-class InvalidJobName(DeploymentException, ValueError):
+class InvalidJobName(DeploymentValidationError):
     def __init__(self, name: str) -> None:
         self.name = name
         super().__init__(
@@ -59,18 +108,20 @@ class InvalidJobName(DeploymentException, ValueError):
             " parts of job references and configuration sections, so they must use"
             " only letters, digits and underscores and may not start with a digit."
             " If you want a human-friendly label for the UI, set it via"
-            " `expose={'display_name': '...'}` and keep `name` a Python identifier."
+            " `expose={'display_name': '...'}` and keep `name` a Python identifier.",
+            subject=name,
         )
 
 
-class InvalidJobSection(DeploymentException, ValueError):
+class InvalidJobSection(DeploymentValidationError):
     def __init__(self, section: str) -> None:
         self.section = section
         super().__init__(
             f"Job section {section!r} is not a valid Python identifier. Sections"
             " become parts of job references and configuration sections, so they"
             " must use only letters, digits and underscores and may not start with"
-            " a digit. Sections default to the module name when not provided."
+            " a digit. Sections default to the module name when not provided.",
+            subject=section,
         )
 
 
@@ -87,19 +138,99 @@ class AmbiguousJobRef(DeploymentException):
         super().__init__(f"ambiguous job name {name!r}, matches: {', '.join(matches)}")
 
 
-class InvalidTrigger(DeploymentException, ValueError):
+class InvalidTrigger(DeploymentValidationError):
     def __init__(self, trigger: str, reason: str) -> None:
         self.trigger = trigger
-        super().__init__(f"Invalid trigger {trigger!r}: {reason}")
+        super().__init__(f"Invalid trigger {trigger!r}: {reason}", errors=[reason], subject=trigger)
 
 
-class InvalidFreshnessConstraint(DeploymentException, ValueError):
+class InvalidFreshnessConstraint(DeploymentValidationError):
     def __init__(self, constraint: str, reason: str) -> None:
         self.constraint = constraint
-        super().__init__(f"Invalid freshness constraint {constraint!r}: {reason}")
+        super().__init__(
+            f"Invalid freshness constraint {constraint!r}: {reason}",
+            errors=[reason],
+            subject=constraint,
+        )
 
 
 class JobResolutionError(DeploymentException):
     def __init__(self, ref: str, reason: str) -> None:
         self.ref = ref
         super().__init__(f"Cannot resolve job {ref!r}: {reason}")
+
+
+class JobAbortedException(DeploymentException):
+    """A job ended its run deliberately without completing its task."""
+
+    def __init__(self, summary: str, result: "TJobResult") -> None:
+        self.summary = summary
+        self.result = result
+        super().__init__(f"Job aborted: {summary}")
+
+
+class ManifestImportError(DeploymentException):
+    """Deployment module cannot be loaded for manifest generation."""
+
+    def __init__(self, name_or_path: str, file_path: str, inner: Exception, kind: str) -> None:
+        self.name_or_path = name_or_path
+        self.file_path = file_path
+        self.inner = inner
+        self.kind = kind
+        if kind == "import_failed":
+            msg = f"Failed to import {file_path!r}: {type(inner).__name__}: {inner}"
+        elif kind == "default_missing":
+            msg = (
+                f"No {name_or_path!r}.py file found in the workspace. Create one and"
+                " import your job declarations and notebook modules into it."
+            )
+        else:
+            msg = (
+                f"Could not import module {name_or_path!r}. Check that the file"
+                " exists and is a valid Python module."
+            )
+        super().__init__(msg)
+
+
+class AmbiguousJobSelector(DeploymentException):
+    """Selector matched multiple jobs; narrow with a more specific selector or `--job-ref`."""
+
+    def __init__(self, matches: Sequence[Tuple["TJobDefinition", str]]) -> None:
+        self.matches = list(matches)
+        job_list = "\n".join(f"  - {jd['job_ref']} (trigger: {t})" for jd, t in matches)
+        super().__init__(
+            "Multiple jobs matched. Use a more specific selector or pass"
+            f" `--job-ref <ref>` to pick one:\n{job_list}"
+        )
+
+
+class JobRefNotInCandidates(DeploymentException):
+    """`--job-ref` doesn't match any candidate from the selector match-set."""
+
+    def __init__(self, job_ref: str, candidates: Sequence[Tuple["TJobDefinition", str]]) -> None:
+        self.job_ref = job_ref
+        self.candidates = list(candidates)
+        refs = ", ".join(jd["job_ref"] for jd, _ in candidates)
+        super().__init__(
+            f"Job ref {job_ref!r} is not among the matched candidates: [{refs}]."
+            " Re-run with a `--job-ref` value from this list, or change the selector."
+        )
+
+
+class NoMatchingJobs(DeploymentException, LookupError):
+    """No job matched the given selectors; lists candidates to choose from instead."""
+
+    def __init__(
+        self,
+        selectors: Sequence[str],
+        available: Sequence[Tuple["TJobDefinition", str]],
+    ) -> None:
+        self.selectors = list(selectors)
+        self.available = list(available)
+        selector_str = ", ".join(selectors) or "<none>"
+        if available:
+            job_list = "\n".join(f"  - {jd['job_ref']} (trigger: {t})" for jd, t in available)
+            body = f"Available jobs:\n{job_list}"
+        else:
+            body = "No matching jobs declared in the manifest."
+        super().__init__(f"No jobs matched selector(s): {selector_str}.\n{body}")

@@ -56,7 +56,11 @@ from dlt.common.storages import SchemaStorage, FileStorage, SchemaStorageConfigu
 from dlt.common.schema.utils import new_table, normalize_table_identifiers
 from dlt.common.storages import ParsedLoadJobFileName, LoadStorage, PackageStorage
 from dlt.common.storages.configuration import FilesystemConfiguration
-from dlt.common.storages.load_package import LoadJobInfo, create_load_id
+from dlt.common.storages.load_package import (
+    LoadJobInfo,
+    LoadPackageStateInjectableContext,
+    create_load_id,
+)
 from dlt.common.typing import StrAny
 from dlt.common.utils import uniq_id
 
@@ -65,7 +69,6 @@ from dlt.destinations.impl.filesystem.configuration import FilesystemDestination
 from dlt.destinations.sql_client import SqlClientBase
 from dlt.destinations.job_client_impl import SqlJobClientBase
 
-from tests.load.lance_utils import LanceRestServerConfig, get_lance_namespace_name
 from tests.utils import (
     ACTIVE_DESTINATIONS,
     ACTIVE_TABLE_FORMATS,
@@ -145,6 +148,16 @@ OBJECT_STORE_RS_BUCKETS = [
     if FilesystemDestinationClientConfiguration.parse_protocol(bucket) in ALL_FILESYSTEM_DRIVERS
 ]
 
+# random per test session: a shared lance namespace root accumulates a `__manifest` version per
+# namespace mutation, slowing all namespace operations down with every test run
+_LANCE_ROOT_SUFFIX = uniq_id(4)
+
+
+def get_lance_namespace_name() -> str:
+    # isolate per xdist worker — Lance __manifest writes conflict on S3
+    return f"dlt_lance_root_{get_test_worker_id()}_{_LANCE_ROOT_SUFFIX}"
+
+
 # Add r2 in extra buckets so it's not run for all tests
 R2_BUCKET_CONFIG = dict(
     bucket_url=R2_BUCKET,
@@ -162,6 +175,9 @@ FILE_LAYOUT_CLASSIC = "{schema_name}.{table_name}.{load_id}.{file_id}.{ext}"
 FILE_LAYOUT_MANY_TABLES_ONE_FOLDER = "{table_name}88{load_id}-u-{file_id}.{ext}"
 FILE_LAYOUT_TABLE_IN_MANY_FOLDERS = "{table_name}/{load_id}/{file_id}.{ext}"
 FILE_LAYOUT_TABLE_NOT_FIRST = "{schema_name}/{table_name}/{load_id}/{file_id}.{ext}"
+# {table_name} terminates the layout so dlt appends `.{ext}` and tables share a folder
+FILE_LAYOUT_TABLE_NAME_ONLY = "{table_name}"
+FILE_LAYOUT_TABLE_FOLDER_ONLY = "{table_name}/"
 
 TEST_FILE_LAYOUTS = [
     DEFAULT_FILE_LAYOUT,
@@ -169,6 +185,8 @@ TEST_FILE_LAYOUTS = [
     FILE_LAYOUT_MANY_TABLES_ONE_FOLDER,
     FILE_LAYOUT_TABLE_IN_MANY_FOLDERS,
     FILE_LAYOUT_TABLE_NOT_FIRST,
+    FILE_LAYOUT_TABLE_NAME_ONLY,
+    FILE_LAYOUT_TABLE_FOLDER_ONLY,
 ]
 
 EXTRA_BUCKETS: List[Dict[str, Any]] = []
@@ -339,6 +357,7 @@ def destinations_configs(
     table_format_filesystem_configs: bool = False,
     table_format_local_configs: bool = False,
     read_only_sqlclient_configs: bool = False,
+    include_cids: Union[str, Sequence[str]] = (),
     subset: Sequence[str] = (),
     bucket_subset: Sequence[str] = (),
     exclude: Sequence[str] = (),
@@ -371,6 +390,7 @@ def destinations_configs(
         table_format_local_configs: Include delta and iceberg configs for local file bucket only.
         read_only_sqlclient_configs: Include all configs that support read-only SQL client
             (filesystem with all buckets, table formats, and lancedb).
+        include_cids: Include configs by configuration id.
 
     Active Destination Filtering:
         The candidate list is first filtered to include only destinations in ACTIVE_DESTINATIONS
@@ -428,19 +448,17 @@ def destinations_configs(
     # build destination configs
     destination_configs: List[DestinationTestConfiguration] = []
 
-    # default sql configs that are also default staging configs
-    default_sql_configs_with_staging = [
-        # Athena needs filesystem staging, which will be automatically set; we have to supply a bucket url though.
+    cid_configs = [
         DestinationTestConfiguration(
-            destination_type="athena",
             cid="athena",
+            destination_type="athena",
             file_format="parquet",
             supports_merge=False,
             bucket_url=AWS_BUCKET,
         ),
         DestinationTestConfiguration(
-            destination_type="athena",
             cid="athena-iceberg",
+            destination_type="athena",
             file_format="parquet",
             bucket_url=AWS_BUCKET,
             supports_merge=True,
@@ -448,8 +466,8 @@ def destinations_configs(
             table_format="iceberg",
         ),
         DestinationTestConfiguration(
-            destination_type="athena",
             cid="athena-s3-tables",
+            destination_type="athena",
             file_format="parquet",
             bucket_url=AWS_BUCKET,
             supports_merge=True,
@@ -458,34 +476,32 @@ def destinations_configs(
             table_format="iceberg",
             naming_convention="s3_tables",
         ),
+        DestinationTestConfiguration(
+            cid="databricks_zerobus",
+            destination_type="databricks",
+            destination_name="databricks_zerobus",
+            env_vars={"DESTINATION__INSERT_API": "zerobus"},
+        ),
     ]
+    cid_configs_by_cid = {config.cid: config for config in cid_configs if config.cid is not None}
 
+    # default sql configs that are also default staging configs
+    default_sql_configs_with_staging = [
+        # Athena needs filesystem staging, which will be automatically set; we have to supply a bucket url though.
+        cid_configs_by_cid["athena"],
+        cid_configs_by_cid["athena-iceberg"],
+        cid_configs_by_cid["athena-s3-tables"],
+    ]
     lance_configs = [
-        # directory namespace configs
-        *[
-            DestinationTestConfiguration(
-                destination_type="lance",
-                extra_info=f"dir-{FilesystemConfiguration.parse_protocol(bucket)}",
-                env_vars={
-                    "DESTINATION__STORAGE__BUCKET_URL": bucket,
-                    "DESTINATION__STORAGE__NAMESPACE_NAME": get_lance_namespace_name(),
-                },
-            )
-            for bucket in OBJECT_STORE_RS_BUCKETS
-        ],
-        # REST namespace configs
-        # NOTE: we exclude cloud storage-backed REST namespaces here because `RestAdapter` (which
-        # we use as test REST Namespace server) does not vend credentials — we only include a
-        # local storage-backed REST namespace, which does not need credentials
-        *[
-            DestinationTestConfiguration(
-                destination_type="lance",
-                extra_info=f"rest-{FilesystemConfiguration.parse_protocol(bucket)}",
-                env_vars=LanceRestServerConfig.get_destination_test_configuration_env_vars(),
-            )
-            for bucket in OBJECT_STORE_RS_BUCKETS
-            if bucket == FILE_BUCKET
-        ],
+        DestinationTestConfiguration(
+            destination_type="lance",
+            extra_info=f"dir-{FilesystemConfiguration.parse_protocol(bucket)}",
+            env_vars={
+                "DESTINATION__STORAGE__BUCKET_URL": bucket,
+                "DESTINATION__STORAGE__NAMESPACE_NAME": get_lance_namespace_name(),
+            },
+        )
+        for bucket in OBJECT_STORE_RS_BUCKETS
     ]
 
     # default non staging sql based configs, one per destination
@@ -542,6 +558,14 @@ def destinations_configs(
                 supports_dbt=False,
                 destination_name="sqlalchemy_sqlite",
                 credentials="sqlite:///db.sqlite",
+            ),
+            DestinationTestConfiguration(
+                destination_type="sqlalchemy",
+                supports_merge=True,
+                supports_dbt=False,
+                destination_name="sqlalchemy_duckdb",
+                # naive literals are read in the session timezone, which defaults to the local one
+                credentials="duckdb:///db.duckdb?TimeZone=UTC",
             ),
             # TODO: enable in sql alchemy destination test, 99% of tests work
             # DestinationTestConfiguration(
@@ -904,6 +928,16 @@ def destinations_configs(
         ]
         destination_configs += lance_configs
 
+    if include_cids:
+        if isinstance(include_cids, str):
+            include_cids = (include_cids,)
+        existing_cids = {config.cid for config in destination_configs if config.cid is not None}
+        destination_configs += [
+            config
+            for config in cid_configs
+            if config.cid in include_cids and config.cid not in existing_cids
+        ]
+
     try:
         # register additional destinations from _addons.py which must be placed in the same folder
         # as tests
@@ -1129,6 +1163,25 @@ def load_table(name: str) -> Dict[str, TTableSchemaColumns]:
         return json.load(f)
 
 
+@contextlib.contextmanager
+def prevent_client_reopen(client: JobClientBase) -> Iterator[JobClientBase]:
+    """No-ops `client.__enter__`/`__exit__` while a caller already holds the connection open."""
+    original_class = client.__class__
+    NoOpLifecycle = type(
+        f"_NoLifecycle{original_class.__name__}",
+        (original_class,),
+        {
+            "__enter__": lambda self: self,
+            "__exit__": lambda self, exc_type, exc_val, exc_tb: None,
+        },
+    )
+    client.__class__ = NoOpLifecycle
+    try:
+        yield client
+    finally:
+        client.__class__ = original_class
+
+
 def expect_load_file(
     client: JobClientBase,
     file_storage: FileStorage,
@@ -1159,7 +1212,8 @@ def expect_load_file(
 
         if isinstance(job, RunnableLoadJob):
             job.set_run_vars(load_id=load_id, schema=client.schema, load_table=table)
-            job.run_managed(client, None)
+            with prevent_client_reopen(client):
+                job.run_managed(client, None)
         # TODO: use semaphore
         while job.state() == "running":
             sleep(0.1)
@@ -1168,26 +1222,34 @@ def expect_load_file(
 
         return job
 
-    if isinstance(client, WithStagingDataset) and client.should_load_data_to_staging_dataset(
-        table_name
+    # jobs may use load package state (e.g. lance fragments) - inject it like the loader does
+    package_storage = PackageStorage(
+        FileStorage(os.path.join(file_storage.storage_path, "normalized_" + load_id)), "normalized"
+    )
+    package_storage.create_package(load_id)
+    with Container().injectable_context(
+        LoadPackageStateInjectableContext(storage=package_storage, load_id=load_id)
     ):
-        # load to staging dataset on merge
-        with client.with_staging_dataset():
+        if isinstance(client, WithStagingDataset) and client.should_load_data_to_staging_dataset(
+            table_name
+        ):
+            # load to staging dataset on merge
+            with client.with_staging_dataset():
+                job = _run_job(file_name)
+        else:
             job = _run_job(file_name)
-    else:
-        job = _run_job(file_name)
-    # execute table chain job
-    if chain_jobs := client.create_table_chain_completed_followup_jobs(
-        [table], [LoadJobInfo("completed_jobs", full_path, 0, 0, 0, job.job_file_info(), "")]  # type: ignore[arg-type]
-    ):
-        assert len(chain_jobs) == 1, "can't execute more than 1 chain job in this test"
-
-        _run_job(chain_jobs[0].new_file_path())
-
-    if isinstance(job, HasFollowupJobs):
-        if chain_jobs := job.create_followup_jobs("completed"):
+        # execute table chain job
+        if chain_jobs := client.create_table_chain_completed_followup_jobs(
+            [table], [LoadJobInfo("completed_jobs", full_path, 0, 0, 0, job.job_file_info(), "")]  # type: ignore[arg-type]
+        ):
             assert len(chain_jobs) == 1, "can't execute more than 1 chain job in this test"
+
             _run_job(chain_jobs[0].new_file_path())
+
+        if isinstance(job, HasFollowupJobs):
+            if chain_jobs := job.create_followup_jobs("completed"):
+                assert len(chain_jobs) == 1, "can't execute more than 1 chain job in this test"
+                _run_job(chain_jobs[0].new_file_path())
 
     return job
 
@@ -1223,6 +1285,7 @@ def yield_client(
     dataset_name: str = None,
     default_config_values: StrAny = None,
     schema_name: str = "event",
+    enter_client: bool = True,
 ) -> Iterator[SqlJobClientBase]:
     os.environ.pop("DATASET_NAME", None)
     # import destination reference by name
@@ -1268,15 +1331,19 @@ def yield_client(
             )
         )
     ):
-        with destination.client(schema, dest_config) as client:  # type: ignore[assignment]
-            try:
-                from dlt.destinations.impl.duckdb.sql_client import WithTableScanners
+        client = destination.client(schema, dest_config)  # type: ignore[assignment]
+        if enter_client:
+            with client:
+                try:
+                    from dlt.destinations.impl.duckdb.sql_client import WithTableScanners
 
-                # open table scanners automatically, context manager above does not do that
-                if issubclass(client.sql_client_class, WithTableScanners):
-                    client.sql_client.open_connection()
-            except (ImportError, MissingDependencyException):
-                pass
+                    # open table scanners automatically, context manager above does not do that
+                    if issubclass(client.sql_client_class, WithTableScanners):
+                        client.sql_client.open_connection()
+                except (ImportError, MissingDependencyException):
+                    pass
+                yield client
+        else:
             yield client
 
 
@@ -1286,8 +1353,9 @@ def cm_yield_client(
     dataset_name: str,
     default_config_values: StrAny = None,
     schema_name: str = "event",
+    enter_client: bool = True,
 ) -> Iterator[SqlJobClientBase]:
-    return yield_client(destination, dataset_name, default_config_values, schema_name)
+    return yield_client(destination, dataset_name, default_config_values, schema_name, enter_client)
 
 
 def yield_client_with_storage(
@@ -1464,8 +1532,7 @@ def count_job_types(p: dlt.Pipeline) -> Dict[str, Dict[str, Any]]:
 
 
 def set_always_refresh_views(config: BaseConfiguration) -> None:
-    # set filesystem views to autorefresh
-    if isinstance(config, FilesystemDestinationClientConfiguration):
+    if "always_refresh_views" in config.get_resolvable_fields():
         config["always_refresh_views"] = True
 
 
@@ -1485,10 +1552,10 @@ def table_update_and_row_for_destination(destination_config: DestinationTestConf
         exclude_types.append("time")
 
     if (
-        destination_config.destination_type in ("synapse", "fabric")
+        destination_config.destination_type == "synapse"
         and destination_config.file_format == "parquet"
     ):
-        # TIME columns are not supported for staged parquet loads into Synapse/Fabric
+        # TIME columns are not supported for staged parquet loads into Synapse
         exclude_types.append("time")
 
     if destination_config.destination_type in (

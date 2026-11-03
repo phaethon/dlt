@@ -3,6 +3,7 @@ from types import ModuleType
 from typing import Any, Dict, List, Optional
 
 from dlt.common import known_env
+from dlt.common.utils import simple_repr
 from dlt.common.configuration.container import Container
 from dlt.common.configuration.providers import EnvironProvider
 from dlt.common.configuration.providers.provider import ConfigProvider
@@ -44,6 +45,9 @@ class WorkspaceRunContext(ProfilesRunContext):
         self._local_dir: str = None
         self._global_dir = global_dir()
         self._config: WorkspaceConfiguration = None
+
+    def __repr__(self) -> str:
+        return simple_repr("WorkspaceRunContext", run_dir=self.run_dir, profile=self.profile)
 
     @property
     def name(self) -> str:
@@ -126,7 +130,7 @@ class WorkspaceRunContext(ProfilesRunContext):
                 _to_run_dir(self._config.settings.working_dir) or self._make_default_working_dir()
             )
             self._local_dir = _to_run_dir(self._config.settings.local_dir) or default_working_dir(
-                self.run_dir,
+                self.settings_dir,
                 self.name,
                 self.profile,
                 DEFAULT_LOCAL_FOLDER,

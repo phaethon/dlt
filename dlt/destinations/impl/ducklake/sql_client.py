@@ -1,6 +1,8 @@
-from typing import ClassVar, Optional, Type
+from typing import ClassVar, Collection, List, Optional, Type
 
+import duckdb
 from duckdb import DuckDBPyConnection
+from packaging.version import Version
 
 from dlt.common import logger
 from dlt.common.configuration.specs.connection_string_credentials import ConnectionStringCredentials
@@ -10,7 +12,12 @@ from dlt.common.storages.fsspec_filesystem import fsspec_from_config
 from dlt.destinations.impl.duckdb.configuration import DuckDbCredentials
 from dlt.destinations.impl.duckdb.sql_client import DuckDBDBApiCursorImpl, DuckDbSqlClient
 from dlt.destinations.impl.ducklake.configuration import DuckLakeCredentials
-from dlt.destinations.sql_client import raise_open_connection_error
+from dlt.destinations.sql_client import (
+    TAttachStatement,
+    WithAttach,
+    attach_statement,
+    raise_open_connection_error,
+)
 
 
 class DuckLakeDBApiCursorImpl(DuckDBDBApiCursorImpl):
@@ -27,11 +34,13 @@ class DuckLakeSqlClient(DuckDbSqlClient):
         credentials: DuckLakeCredentials,
         capabilities: DestinationCapabilitiesContext,
         override_data_path: bool = False,
+        automatic_migration: bool = False,
     ) -> None:
         super().__init__(dataset_name, staging_dataset_name, credentials, capabilities)
         self.credentials: DuckLakeCredentials = credentials
         self._attach_statement: str = None
         self.override_data_path = override_data_path
+        self.automatic_migration = automatic_migration
 
     def create_dataset(self) -> None:
         if self.has_dataset():
@@ -88,6 +97,41 @@ class DuckLakeSqlClient(DuckDbSqlClient):
                 self._conn.execute(f"USE memory;DETACH {self.credentials.ducklake_name}")
         return super().close_connection()
 
+    def attach_statements(
+        self, *, alias: str, tables: Optional[Collection[str]] = None
+    ) -> List[TAttachStatement]:
+        # the statements attach the whole lake, so `tables` cannot narrow it
+        statements: List[TAttachStatement] = []
+        storage = self.credentials.storage
+        if not storage.is_local_filesystem:
+            secret_name = self.create_secret_name(storage.bucket_url)
+            statements += [
+                # one key for the whole set: when the client emits the set again, it replaces
+                # the rotated credentials
+                attach_statement(s, secret=True, key=f"{alias}:secret")
+                for s in self._build_secret_statements(
+                    storage.bucket_url, storage.credentials, secret_name, "", False
+                )
+            ]
+        # `alias` names the local attach catalog. `metadata_schema` must stay the schema of the
+        # original lake
+        attach = self.build_attach_statement(
+            ducklake_name=alias,
+            metadata_schema=self.credentials.metadata_schema or self.credentials.ducklake_name,
+            catalog=self.credentials.catalog,
+            storage_url=self.credentials.storage_url,
+            override_data_path=self.override_data_path,
+            automatic_migration=self.automatic_migration,
+        )
+        # postgres and mysql catalogs embed the password in the attach url, so it is a secret
+        is_secret = getattr(self.credentials.catalog, "drivername", "") in (
+            "postgres",
+            "postgresql",
+            "mysql",
+        )
+        statements.append(attach_statement(attach, secret=is_secret, key=f"{alias}:attach"))
+        return statements
+
     def create_secret(
         self,
         scope: str,
@@ -96,10 +140,13 @@ class DuckLakeSqlClient(DuckDbSqlClient):
         persist_secrets: bool = False,
     ) -> None:
         protocol = self.credentials.storage.protocol
-        if protocol in ["az", "abfss"]:
+        # native azure support landed in DuckLake 1.0 (duckdb >= 1.5.2). on older versions fall back
+        # to fsspec which degrades performance - upgrade duckdb to use native adlfs support.
+        if protocol in ["az", "abfss"] and Version(duckdb.__version__) < Version("1.5.2"):
             logger.warning(
-                "abfss is not supported by DuckLake. "
-                "Falling back to fsspec which degrades scanning performance."
+                "abfss is not supported by DuckLake before 1.0 (duckdb < 1.5.2). Falling back to"
+                " fsspec which degrades performance. Upgrade duckdb to >= 1.5.2 to use native Azure"
+                " (adlfs) support."
             )
             self._register_filesystem(fsspec_from_config(self.credentials.storage)[0], "abfss")
         elif not super().create_secret(
@@ -110,9 +157,9 @@ class DuckLakeSqlClient(DuckDbSqlClient):
         ):
             if protocol in ["gs", "gcs"]:
                 logger.warning(
-                    "For gs/gcs access via duckdb please use the gs/gcs s3 compatibility"
-                    "layer if possible. "
-                    "Falling back to fsspec which degrades scanning performance."
+                    "Native gs/gcs access requires duckdb >= 1.4.0. Falling back to fsspec which"
+                    " degrades scanning performance. Upgrade duckdb or use the gs/gcs s3"
+                    " compatibility layer."
                 )
                 self._register_filesystem(fsspec_from_config(self.credentials.storage)[0], "gcs")
             else:
@@ -126,6 +173,7 @@ class DuckLakeSqlClient(DuckDbSqlClient):
         catalog: ConnectionStringCredentials,
         storage_url: str,
         override_data_path: bool = False,
+        automatic_migration: bool = False,
     ) -> str:
         attach_params = ""
         metadata_schema = metadata_schema or ducklake_name
@@ -145,15 +193,21 @@ class DuckLakeSqlClient(DuckDbSqlClient):
             )
             attach_statement = f"ATTACH IF NOT EXISTS 'ducklake:md:{catalog.database}'"
             attach_params = f", METADATA_SCHEMA '{metadata_schema}'"
-        elif catalog.drivername in ("sqlite", "duckdb"):
-            # attach sqllite with multi-process access
+        elif catalog.drivername == "sqlite":
+            # attach sqlite with multi-process access
             attach_statement = f"ATTACH IF NOT EXISTS 'ducklake:{catalog.database}'"
             attach_params = ", META_TYPE 'sqlite', META_JOURNAL_MODE 'WAL', META_BUSY_TIMEOUT 1000"
+        elif catalog.drivername == "duckdb":
+            # DuckDB-backed catalog: no META_TYPE, DuckLake opens it natively
+            attach_statement = f"ATTACH IF NOT EXISTS 'ducklake:{catalog.database}'"
         else:
             raise NotImplementedError(str(catalog))
         attach_statement += f" AS {ducklake_name}"
         override_param = ", OVERRIDE_DATA_PATH true" if override_data_path else ""
-        attach_statement += f" (DATA_PATH '{storage_url}'{attach_params}{override_param})"
+        migration_param = ", AUTOMATIC_MIGRATION true" if automatic_migration else ""
+        attach_statement += (
+            f" (DATA_PATH '{storage_url}'{attach_params}{override_param}{migration_param})"
+        )
         return attach_statement
 
     @property
@@ -168,4 +222,5 @@ class DuckLakeSqlClient(DuckDbSqlClient):
                 catalog=self.credentials.catalog,
                 storage_url=self.credentials.storage_url,
                 override_data_path=self.override_data_path,
+                automatic_migration=self.automatic_migration,
             )

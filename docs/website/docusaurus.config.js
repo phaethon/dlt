@@ -1,72 +1,109 @@
 // @ts-check
 // Note: type annotations allow type checking and IDEs autocompletion
-const fs = require("fs")
-require('dotenv').config()
+const fs = require("node:fs");
+require("dotenv").config();
 
-// const lightCodeTheme = require('prism-react-renderer/themes/dracula');
-const lightCodeTheme = require('prism-react-renderer/themes/github');
-const darkCodeTheme = require('prism-react-renderer/themes/dracula');
+const synthwave84 = require("prism-react-renderer/themes/synthwave84");
+
+// synthwave84 without the glow; its plain background is painted on every line, custom.css sets the block's
+const darkCodeTheme = {
+  plain: { color: synthwave84.plain.color },
+  styles: [
+    ...synthwave84.styles.map(({ types, style }) => {
+      const { textShadow: _shadow, ...rest } = style;
+      return { types, style: rest };
+    }),
+    { types: ["tree-line"], style: { color: "#5c5c80" } },
+  ],
+};
+
+// same token groups as synthwave84, with colors readable on a light background
+const lightCodeTheme = {
+  plain: { color: "#24292f", backgroundColor: "#f6f8fa" },
+  styles: [
+    {
+      types: ["comment", "block-comment", "prolog", "doctype", "cdata"],
+      style: { color: "#6e7781", fontStyle: "italic" },
+    },
+    { types: ["punctuation", "operator"], style: { color: "#57606a" } },
+    { types: ["tag", "attr-name", "namespace", "number", "unit", "hexcode", "deleted"], style: { color: "#b4372f" } },
+    { types: ["property", "selector"], style: { color: "#11795c" } },
+    { types: ["function-name"], style: { color: "#2563a8" } },
+    { types: ["boolean", "selector-id", "function"], style: { color: "#0e6a85" } },
+    { types: ["class-name", "maybe-class-name", "builtin"], style: { color: "#9d174d" } },
+    { types: ["constant", "symbol"], style: { color: "#a21caf" } },
+    { types: ["important", "atrule", "keyword", "selector-class"], style: { color: "#4c4898" } },
+    { types: ["string", "char", "attr-value", "regex", "variable"], style: { color: "#b45309" } },
+    { types: ["parameter", "italic"], style: { fontStyle: "italic" } },
+    { types: ["entity", "url"], style: { color: "#0f766e" } },
+    { types: ["important", "bold"], style: { fontWeight: "bold" } },
+    { types: ["inserted"], style: { color: "#116329" } },
+    { types: ["tree-line"], style: { color: "#afb8c1" } },
+  ],
+};
 
 // create versions config
-const versions = {"current": {
-  label: 'devel',
-  path: 'devel',
-  noIndex: true
-}}
+const versions = {
+  current: {
+    label: "devel",
+    path: "devel",
+    noIndex: true,
+  },
+};
 
 let knownVersions = [];
 if (fs.existsSync("versions.json")) {
-  knownVersions = JSON.parse(fs.readFileSync("versions.json", 'utf8'));
+  knownVersions = JSON.parse(fs.readFileSync("versions.json", "utf8"));
 }
 
 // inject master version renaming only if versions present and master included
 if (knownVersions) {
-  let latestLabel = "latest"
+  let latestLabel = "latest";
   if (process.env.DOCUSAURUS_DLT_VERSION) {
-    latestLabel = `${process.env.DOCUSAURUS_DLT_VERSION} (latest)`
+    latestLabel = `${process.env.DOCUSAURUS_DLT_VERSION} (latest)`;
   }
 
   if (knownVersions.includes("master")) {
-    versions["master"] = {
+    versions.master = {
       label: latestLabel,
-      path: '/'
-    }
+      path: "/",
+    };
   }
 
   // disable indexing for all known versions
-  for (let v of knownVersions) {
-    if (v == "master") {
+  for (const v of knownVersions) {
+    if (v === "master") {
       continue;
     }
     versions[v] = {
-      noIndex: true
-    }
+      noIndex: true,
+    };
   }
 }
 
 /** @type {import('@docusaurus/types').Config} */
 const config = {
-  title: 'dlt Docs',
-  tagline: 'data load tool',
-  url: 'https://dlthub.com',
-  baseUrl: '/docs',
-  onBrokenLinks: 'throw',
-  onBrokenAnchors: 'throw',
-  favicon: 'img/favicon.ico',
-  staticDirectories: ['public', 'static'],
+  title: "dlt Docs",
+  tagline: "data load tool",
+  url: "https://dlthub.com",
+  baseUrl: "/docs",
+  onBrokenLinks: "throw",
+  onBrokenAnchors: "throw",
+  favicon: "img/favicon.ico",
+  staticDirectories: ["public", "static"],
   trailingSlash: false,
 
   // GitHub pages deployment config.
   // If you aren't using GitHub pages, you don't need these.
-  organizationName: 'dltHub', // Usually your GitHub org/user name.
-  projectName: 'dlt', // Usually your repo name.
+  organizationName: "dltHub", // Usually your GitHub org/user name.
+  projectName: "dlt", // Usually your repo name.
 
   // Even if you don't use internalization, you can use this field to set useful
   // metadata like html lang. For example, if your site is Chinese, you may want
   // to replace "en" with "zh-Hans".
   i18n: {
-    defaultLocale: 'en',
-    locales: ['en'],
+    defaultLocale: "en",
+    locales: ["en"],
   },
 
   future: {
@@ -81,55 +118,69 @@ const config = {
   markdown: {
     mermaid: true,
     hooks: {
-      onBrokenMarkdownLinks: 'throw',
+      onBrokenMarkdownLinks: "throw",
     },
   },
-  themes: ['@docusaurus/theme-mermaid'],
+  themes: ["@docusaurus/theme-mermaid"],
 
   presets: [
     [
-      '@docusaurus/preset-classic',
-      ({
+      "@docusaurus/preset-classic",
+      {
         docs: {
-          routeBasePath: '/',
-          path: 'docs_processed',
-          include: ['**/*.md', '**/*.mdx'],
+          routeBasePath: "/",
+          path: "docs_processed",
+          include: ["**/*.md", "**/*.mdx"],
           exclude: [
             // '**/_*.{js,jsx,ts,tsx,md,mdx}',
             // '**/_*/**',
-            '**/*.test.{js,jsx,ts,tsx}',
-            '**/__tests__/**',
+            // the defaults above would also drop the generated `__init__.md` API reference
+            // pages, so only the hand-written partials are excluded; they can still be imported
+            "_*.{md,mdx}",
+            "dlt-ecosystem/**/_*.{md,mdx}",
+            "**/*.test.{js,jsx,ts,tsx}",
+            "**/__tests__/**",
           ],
-          sidebarPath: require.resolve('./sidebars.js'),
+          sidebarPath: require.resolve("./sidebars.js"),
           editUrl: (params) => {
-            return "https://github.com/dlt-hub/dlt/tree/devel/docs/website/docs/" + params.docPath;
+            return `https://github.com/dlt-hub/dlt/tree/devel/docs/website/docs/${params.docPath}`;
           },
           versions: versions,
           showLastUpdateAuthor: true,
           showLastUpdateTime: true,
         },
         theme: {
-          customCss: require.resolve('./src/css/custom.css'),
+          customCss: require.resolve("./src/css/custom.css"),
         },
-      }),
+        sitemap: {
+          // the search page is not content
+          ignorePatterns: ["/docs/search"],
+        },
+      },
     ],
   ],
 
   plugins: [
+    // re-runs the python docs preprocessor when `website/docs` sources change
+    require.resolve("./plugins/preprocess-docs"),
+    // serves the last built search index during `docusaurus start`
+    require.resolve("./plugins/pagefind-dev"),
     [
-      require.resolve('./plugins/llms-txt'),
+      require.resolve("./plugins/llms-txt"),
       {
-        siteTitle: 'dlt - data load tool',
-        siteDescription: 'dlt is an open-source Python library that loads data from various sources into well-structured datasets. Built for LLMs with 8000+ source connectors.',
-        excludeFromMd: ['api_reference/'],
-        excludeFromIndex: ['devel/'],
+        siteTitle: "dlt - data load tool",
+        siteDescription:
+          "dlt is an open-source Python library that loads data from various sources into well-structured datasets. Built for LLMs with 11,000+ source connectors.",
+        excludeFromMd: ["api_reference/"],
+        excludeFromIndex: ["devel/"],
         groupDepth: 2,
         separateIndexes: [
           {
-            prefix: 'hub/',
-            title: 'dltHub',
-            description: 'dltHub is a managed platform for dlt pipelines with a web UI, pipeline runner, and collaboration features.',
-            sidebar: 'hubSidebar',
+            prefix: "hub/",
+            title: "dltHub",
+            description:
+              "dltHub is a managed platform for dlt pipelines with a web UI, pipeline runner, and collaboration features.",
+            sidebar: "hubSidebar",
           },
         ],
       },
@@ -140,45 +191,61 @@ const config = {
     /** @type {import('@docusaurus/preset-classic').ThemeConfig} */
     ({
       navbar: {
-        title: '',
+        title: "",
         logo: {
-          alt: 'dlt Docs Logo',
-          src: 'img/dlthub-logo.png',
-          href: 'https://dlthub.com'
+          alt: "dlt Docs Logo",
+          src: "img/dlthub-logo.png",
+          href: "https://dlthub.com",
         },
         items: [
           {
-            type: 'docsVersionDropdown',
+            type: "docsVersionDropdown",
           },
           {
-            type: 'docSidebar',
-            sidebarId: 'docsSidebar',
-            position: 'left',
-            label: 'dlt',
+            type: "docSidebar",
+            sidebarId: "hubSidebar",
+            position: "left",
+            label: "dltHub",
           },
           {
-            type: 'docSidebar',
-            sidebarId: 'cookbookSidebar',
-            position: 'left',
-            label: 'Cookbook',
+            type: "docSidebar",
+            sidebarId: "docsSidebar",
+            position: "left",
+            label: "dlt",
           },
           {
-            type: 'docSidebar',
-            sidebarId: 'educationSidebar',
-            position: 'left',
-            label: 'Education',
-          },
-          { to: '/release-highlights', label: "What's new?", position: 'left' },
-          { to: 'https://dlthub.com/blog', label: 'Blog', position: 'right' },
-          {
-            href: 'https://dlthub.com/community',
-            position: 'right',
-            className: 'slack-navbar',
+            type: "docSidebar",
+            sidebarId: "cookbookSidebar",
+            position: "left",
+            label: "Cookbook",
           },
           {
-            href: 'https://github.com/dlt-hub/dlt',
-            position: 'right',
-            className: 'github-navbar',
+            type: "docSidebar",
+            sidebarId: "educationSidebar",
+            position: "left",
+            label: "Education",
+          },
+          {
+            type: "dropdown",
+            label: "What's new?",
+            position: "left",
+            items: [
+              { to: "/release-highlights", label: "dlt" },
+              // devel-scoped until this page reaches master; retarget to
+              // /hub/release-highlights once it is in the released version
+              { to: "/devel/hub/release-highlights", label: "dltHub" },
+            ],
+          },
+          { to: "https://dlthub.com/blog", label: "Blog", position: "right" },
+          {
+            href: "https://dlthub.com/community",
+            position: "right",
+            className: "slack-navbar",
+          },
+          {
+            href: "https://github.com/dlt-hub/dlt",
+            position: "right",
+            className: "github-navbar",
             "aria-label": "GitHub repository",
           },
         ],
@@ -189,46 +256,46 @@ const config = {
         },
       },
       footer: {
-        style: 'dark',
+        style: "dark",
         links: [
           {
-            title: 'Community',
+            title: "Community",
             items: [
               {
-                label: 'Slack',
-                href: 'https://dlthub.com/community',
-                className: 'footer-link'
+                label: "Slack",
+                href: "https://dlthub.com/community",
+                className: "footer-link",
               },
               {
-                label: 'Email',
-                href: 'mailto:community@dlthub.com',
-                className: 'footer-link'
+                label: "Email",
+                href: "mailto:community@dlthub.com",
+                className: "footer-link",
               },
             ],
           },
           {
-            title: 'More',
+            title: "More",
             items: [
               {
-                label: 'GitHub',
-                href: 'https://github.com/dlt-hub/dlt',
-                className: 'footer-link'
+                label: "GitHub",
+                href: "https://github.com/dlt-hub/dlt",
+                className: "footer-link",
               },
               {
-                label: 'Twitter',
-                href: 'https://twitter.com/dlthub',
-                className: 'footer-link'
-              }
+                label: "Twitter",
+                href: "https://twitter.com/dlthub",
+                className: "footer-link",
+              },
             ],
           },
           {
-            title: 'Workspace',
+            title: "Workspace",
             items: [
               {
-                label: 'Scaffoldings',
-                href: 'https://dlthub.com/workspace',
-                className: 'footer-link'
-              }
+                label: "Context",
+                href: "https://dlthub.com/context",
+                className: "footer-link",
+              },
             ],
           },
         ],
@@ -237,23 +304,18 @@ const config = {
       prism: {
         theme: lightCodeTheme,
         darkTheme: darkCodeTheme,
-        additionalLanguages: ['powershell', 'bash', 'python', 'toml', 'yaml', 'log'],
+        additionalLanguages: ["powershell", "bash", "python", "toml", "yaml", "log"],
       },
-      metadata: [{ name: 'keywords', content: 'data loading, elt, etl, extract, load, transform, python, data engineering, data warehouse, data lake' }],
-      algolia: {
-        // The application ID provided by Algolia
-        appId: 'FUTSIDO7MI',
-
-        // Public API key: it is safe to commit it
-        apiKey: '94b8ae9b02673db8232fc6fe712bc5a0',
-
-        indexName: 'dlthub',
-
-        // Optional: see doc section below
-        contextualSearch: false,
-      },
+      metadata: [
+        {
+          name: "keywords",
+          content:
+            "data loading, elt, etl, extract, load, transform, python, data engineering, data warehouse, data lake",
+        },
+      ],
+      // search: Pagefind, see src/theme/SearchBar and pagefind.yml
       colorMode: {
-        defaultMode:'dark',
+        defaultMode: "dark",
         disableSwitch: false,
         respectPrefersColorScheme: true,
       },
@@ -261,12 +323,12 @@ const config = {
 
   scripts: [
     {
-      src: 'https://dlt-static.s3.eu-central-1.amazonaws.com/dhelp.js',
+      src: "https://dlt-static.s3.eu-central-1.amazonaws.com/dhelp.js",
       async: true,
       defer: true,
     },
     {
-      src: 'https://dlthub.com/js/tm.js',
+      src: "https://dlthub.com/js/tm.js",
       async: true,
     },
   ],

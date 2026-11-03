@@ -10,14 +10,20 @@ EXPLICIT_VALUES_PROVIDER_NAME = "ExplicitValues"
 class ConfigProvider(abc.ABC):
     @abc.abstractmethod
     def get_value(
-        self, key: str, hint: Type[Any], pipeline_name: str, *sections: str
+        self, key: str, hint: Type[Any], pipeline_name: Optional[str], *sections: str
     ) -> Tuple[Optional[Any], str]:
         """Looks for a value under `key` in section(s) `sections` and tries to coerce the
         value to type `hint`. A pipeline context (top level section) will be added if
         `pipeline_name` was specified.
         """
 
-    def set_value(self, key: str, value: Any, pipeline_name: str, *sections: str) -> None:
+    def get_value_location(self, key: str, pipeline_name: Optional[str], *sections: str) -> str:
+        """Returns exact location (ie. a file name) of a value obtained with `get_value`, empty if
+        not known.
+        """
+        return self.present_locations[0] if self.present_locations else ""
+
+    def set_value(self, key: str, value: Any, pipeline_name: Optional[str], *sections: str) -> None:
         raise NotImplementedError()
 
     @property

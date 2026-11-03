@@ -4,19 +4,20 @@ from pydantic import Field
 from fastmcp.exceptions import ToolError
 
 from dlt.common.typing import Annotated
-from dlt._workspace.cli.ai.utils import (
+from dlt._workspace.cli.dlthub.ai.utils import (
     DEFAULT_AI_WORKBENCH_BRANCH,
     DEFAULT_AI_WORKBENCH_REPO,
     fetch_workbench_base,
     fetch_workbench_toolkit_info,
     fetch_workbench_toolkits,
 )
+from dlt._workspace.cli.dlthub.ai.typing import TToolkitInfo, TWorkbenchToolkitInfo
+from dlt._workspace.access import RequiresAccess
 from dlt._workspace.mcp.context import with_mcp_tool_telemetry
-from dlt._workspace.typing import TToolkitInfo, TWorkbenchToolkitInfo
 
 
 @with_mcp_tool_telemetry()
-def list_toolkits() -> Dict[str, TToolkitInfo]:
+def list_toolkits() -> Annotated[Dict[str, TToolkitInfo], RequiresAccess()]:
     """List available dlt AI toolkits with their names and descriptions."""
     try:
         base = fetch_workbench_base(DEFAULT_AI_WORKBENCH_REPO, DEFAULT_AI_WORKBENCH_BRANCH)
@@ -29,7 +30,7 @@ def list_toolkits() -> Dict[str, TToolkitInfo]:
 @with_mcp_tool_telemetry()
 def toolkit_info(
     name: Annotated[str, Field(description="Name of the toolkit to inspect")],
-) -> TWorkbenchToolkitInfo:
+) -> Annotated[TWorkbenchToolkitInfo, RequiresAccess()]:
     """Show detailed contents of a dlt AI toolkit."""
     try:
         info = fetch_workbench_toolkit_info(

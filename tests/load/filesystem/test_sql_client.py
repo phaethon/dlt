@@ -1,7 +1,8 @@
 """Test the duckdb supported sql client for special internal features"""
 
 
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import pytest
 import dlt
@@ -11,12 +12,17 @@ import shutil
 import pyarrow
 
 from dlt import Pipeline
+from dlt.common.configuration.specs import AzureServicePrincipalCredentials
 from dlt.common.utils import uniq_id
 from dlt.common.schema.typing import TTableFormat
+from dlt.destinations.impl.duckdb.sql_client import DuckDbSqlClient
+from dlt.destinations.impl.filesystem.sql_client import FilesystemSqlClient
 
 from tests.load.utils import (
     destinations_configs,
     DestinationTestConfiguration,
+    ABFS_BUCKET,
+    AZ_BUCKET,
     GCS_BUCKET,
     SFTP_BUCKET,
     MEMORY_BUCKET,
@@ -24,7 +30,9 @@ from tests.load.utils import (
 from dlt.destinations import filesystem
 from tests.utils import get_test_storage_root
 from tests.cases import arrow_table_all_data_types
-from dlt.destinations.exceptions import DatabaseUndefinedRelation
+import duckdb
+
+from dlt.destinations.exceptions import DatabaseTerminalException, DatabaseUndefinedRelation
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -146,7 +154,8 @@ def _run_dataset_checks(
         external_db.sql("SET azure_transport_option_type = 'curl';")
         external_db.sql(f"SET secret_directory = '{secret_directory}';")
         if table_format == "iceberg":
-            FilesystemSqlClient._setup_iceberg(external_db)
+            for statement in FilesystemSqlClient._iceberg_setup_statements():
+                external_db.execute(statement)
         return external_db
 
     def _fs_sql_client_for_external_db(
@@ -456,3 +465,179 @@ def test_evolving_filesystem(
     # check df and arrow access
     assert len(pipeline.dataset().items.df().index) == 50
     assert pipeline.dataset().items.arrow().num_rows == 50
+
+
+def _external_azure_session() -> AzureServicePrincipalCredentials:
+    """Azure credentials with a user-passed azure-identity credential, frozen to a bearer token."""
+    from azure.identity import ClientSecretCredential
+
+    principal: Dict[str, Any] = dlt.secrets.get("destination.fsazureprincipal.credentials")
+    credentials = AzureServicePrincipalCredentials.from_credential(
+        ClientSecretCredential(
+            tenant_id=principal["azure_tenant_id"],
+            client_id=principal["azure_client_id"],
+            client_secret=principal["azure_client_secret"],
+        )
+    )
+    credentials.azure_storage_account_name = principal["azure_storage_account_name"]
+    return credentials
+
+
+@pytest.mark.essential
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(
+        all_buckets_filesystem_configs=True, bucket_subset=(GCS_BUCKET, AZ_BUCKET, ABFS_BUCKET)
+    ),
+    ids=lambda x: x.name,
+)
+def test_frozen_token_secret_recreated_before_expiry(
+    destination_config: DestinationTestConfiguration, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dataset that holds its connection creates a secret with a frozen bearer token again
+    before the token expires. gcs tokens and tokens of external azure sessions are frozen."""
+    if destination_config.file_format not in ["parquet", "jsonl"]:
+        pytest.skip(
+            f"Test only works for jsonl and parquet, given: {destination_config.file_format}"
+        )
+    destination = None
+    if destination_config.bucket_url != GCS_BUCKET:
+        destination = filesystem(
+            destination_config.bucket_url, credentials=_external_azure_session()
+        )
+    pipeline = destination_config.setup_pipeline(
+        "read_pipeline", dataset_name="test_token_refresh", dev_mode=True, destination=destination
+    )
+    pipeline.run([{"id": 1}, {"id": 2}], table_name="items", **destination_config.run_kwargs)
+
+    expirations: List[Optional[datetime]] = []
+    build_secret = DuckDbSqlClient._build_secret
+
+    def _first_token_expires_soon(
+        *args: Any, **kwargs: Any
+    ) -> Tuple[List[str], Optional[datetime]]:
+        sql, expires_at = build_secret(*args, **kwargs)
+        expirations.append(expires_at)
+        if len(expirations) == 1:
+            expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
+        return sql, expires_at
+
+    monkeypatch.setattr(DuckDbSqlClient, "_build_secret", staticmethod(_first_token_expires_soon))
+
+    dataset = pipeline.dataset()
+    with dataset:
+        sql_client = cast(FilesystemSqlClient, dataset.sql_client)
+        assert expirations[0] is not None
+        # the first token is about to expire, so the client creates the secret before the query
+        assert sql_client.execute_sql("SELECT COUNT(*) FROM items")[0][0] == 2
+        assert len(expirations) == 2
+        # the new token lives long enough
+        assert sql_client.execute_sql("SELECT COUNT(*) FROM items")[0][0] == 2
+        assert len(expirations) == 2
+
+
+@pytest.mark.essential
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(local_filesystem_configs=True),
+    ids=lambda x: x.name,
+)
+def test_auto_views_not_created_for_other_dataset_qualified_table(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """The scanner only creates views for tables that belong to its own dataset. A query that
+    references a same-named table qualified with a different schema (i.e. another dataset) must read
+    that table directly and must NOT trigger creation of a scanner view for the dataset's table."""
+    if destination_config.file_format not in ["parquet", "jsonl"]:
+        pytest.skip(
+            f"Test only works for jsonl and parquet, given: {destination_config.file_format}"
+        )
+
+    pipeline = destination_config.setup_pipeline(
+        "read_pipeline",
+        dataset_name="test_other_dataset_no_view",
+        dev_mode=True,
+    )
+
+    # the dataset has its own `items` table - a view would be created for it on a matching query
+    @dlt.resource(name="items")
+    def items():
+        yield [{"id": 1, "value": "hello"}]
+
+    pipeline.run(items(), **destination_config.run_kwargs)
+
+    dataset = pipeline.dataset()
+    with dataset:
+        conn: duckdb.DuckDBPyConnection = dataset.sql_client.native_connection
+        # a real table named `items` living in another schema, i.e. a different dataset
+        conn.execute("CREATE SCHEMA manual_schema")
+        conn.execute("CREATE TABLE manual_schema.items(id INTEGER)")
+        conn.execute("INSERT INTO manual_schema.items VALUES (42)")
+
+        # querying the table qualified with the other schema reads it directly
+        rows = dataset.query(
+            "SELECT * FROM manual_schema.items ORDER BY id", _execute_raw_query=True
+        ).fetchall()
+        assert rows == [(42,)]
+
+        # the scanner must not have created a view for `items`: the reference was qualified with a
+        # schema that is not the dataset name, so the dataset's own `items` table is left untouched
+        views = conn.execute("SELECT view_name FROM duckdb_views()").fetchall()
+        assert "items" not in [v[0] for v in views]
+
+
+@pytest.mark.essential
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(local_filesystem_configs=True),
+    ids=lambda x: x.name,
+)
+def test_pipeline_sql_client_exposes_all_pipeline_schemas(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """`pipeline.sql_client()` must register every pipeline schema so the scanner creates views for
+    tables that live in a non-default schema of the same dataset."""
+    if destination_config.file_format not in ["parquet", "jsonl"]:
+        pytest.skip(
+            f"Test only works for jsonl and parquet, given: {destination_config.file_format}"
+        )
+
+    pipeline = destination_config.setup_pipeline(
+        "multi_schema_pipeline",
+        dataset_name="test_multi_schema_sql_client",
+        dev_mode=True,
+    )
+
+    @dlt.source(name="schema_a")
+    def source_a():
+        @dlt.resource(name="items_a")
+        def items_a():
+            yield [{"id": i} for i in range(3)]
+
+        return items_a
+
+    @dlt.source(name="schema_b")
+    def source_b():
+        @dlt.resource(name="items_b")
+        def items_b():
+            yield [{"id": i} for i in range(5)]
+
+        return items_b
+
+    # both sources land in the same dataset under different schemas
+    pipeline.run(source_a(), **destination_config.run_kwargs)
+    pipeline.run(source_b(), **destination_config.run_kwargs)
+    assert {"schema_a", "schema_b"}.issubset(set(pipeline.schema_names))
+
+    # the default-schema client must resolve tables from every schema of the dataset
+    with pipeline.sql_client() as c:
+        for table_name, expected in [("items_a", 3), ("items_b", 5)]:
+            qualified = c.make_qualified_table_name(table_name)
+            with c.execute_query(f"SELECT COUNT(*) FROM {qualified}") as cursor:
+                assert cursor.fetchone()[0] == expected
+
+    # an explicit schema_name keeps its own default while still exposing the other schema's views
+    with pipeline.sql_client(schema_name="schema_b") as c:
+        qualified = c.make_qualified_table_name("items_a")
+        with c.execute_query(f"SELECT COUNT(*) FROM {qualified}") as cursor:
+            assert cursor.fetchone()[0] == 3

@@ -54,26 +54,8 @@ class MsSqlStagingReplaceJob(SqlStagingReplaceFollowupJob):
 
 class MsSqlMergeJob(SqlMergeFollowupJob):
     @classmethod
-    def gen_key_table_clauses(
-        cls,
-        root_table_name: str,
-        staging_root_table_name: str,
-        primary_keys: Sequence[str],
-        merge_keys: Sequence[str],
-        for_delete: bool,
-    ) -> List[str]:
-        """Generate sql clauses that may be used to select or delete rows in root table of destination dataset"""
-        if for_delete:
-            # MS SQL doesn't support alias in DELETE FROM
-            key_clauses = cls._gen_key_table_clauses(primary_keys, merge_keys)
-            return [
-                f"FROM {root_table_name} WHERE EXISTS (SELECT 1 FROM"
-                f" {staging_root_table_name} WHERE"
-                f" {' OR '.join([c.format(d=root_table_name,s=staging_root_table_name) for c in key_clauses])})"
-            ]
-        return SqlMergeFollowupJob.gen_key_table_clauses(
-            root_table_name, staging_root_table_name, primary_keys, merge_keys, for_delete
-        )
+    def supports_alias_in_delete(cls) -> bool:
+        return False
 
     @classmethod
     def _to_temp_table(
@@ -92,6 +74,9 @@ class MsSqlMergeJob(SqlMergeFollowupJob):
 
 class MssqlParquetCopyJob(AdbcParquetCopyJob):
     _config: MsSqlClientConfiguration
+    # mssql ADBC driver buffers the full input stream in memory; flush per row-group
+    # to bound peak memory and avoid OOM on large parquet files
+    _ingest_per_rowgroup: bool = True
 
     if TYPE_CHECKING:
         from adbc_driver_manager.dbapi import Connection

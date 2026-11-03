@@ -1,6 +1,21 @@
+import functools
 import os
 import warnings
-from typing import Any, ClassVar, Dict, List, Optional, Protocol, Sequence, Set
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Protocol,
+    Sequence,
+    Set,
+    Type,
+    Union,
+)
 import pluggy
 import argparse
 import importlib.metadata
@@ -11,6 +26,10 @@ from dlt.common.known_env import DLT_DISABLE_PLUGINS
 
 hookspec = pluggy.HookspecMarker("dlt")
 hookimpl = pluggy.HookimplMarker("dlt")
+
+
+TCliCommandCompose = Literal["replace", "extend", "additive"]
+"""How a CLI command merges with other plugins' commands of the same `(parent, command)`."""
 
 
 class PluginContext(ContainerInjectableContext):
@@ -97,19 +116,29 @@ def plug_run_context(
 
 
 class SupportsCliCommand(Protocol):
-    """Protocol for defining one dlt cli command"""
+    """Protocol for defining one dlt cli command."""
 
     command: str
     """name of the command"""
     help_string: str
     """the help string for argparse"""
     description: Optional[str]
-    """the more detailed description for argparse, may inlcude markdown for the docs"""
+    """the more detailed description for argparse, may include markdown for the docs"""
     docs_url: Optional[str]
     """the default docs url to be printed in case of an exception"""
 
+    parent: Optional[str] = None
+    """When set, this command is registered as a subcommand under the top-level `parent` command"""
+    compose: TCliCommandCompose = "replace"
+    """How this command merges when multiple plugins register the same `(parent, command)`.
+
+    - `replace` (default): first registered wins; rest dropped.
+    - `extend`: first plugin's `configure_parser` runs; ALL plugins' `execute` fire in order.
+    - `additive`: additional subparsers may be added to top level command
+    """
+
     def configure_parser(self, parser: argparse.ArgumentParser) -> None:
-        """Configures the parser for the given argument"""
+        """Configures the parser for the given argument."""
         ...
 
     def execute(self, args: argparse.Namespace) -> None:
@@ -117,9 +146,37 @@ class SupportsCliCommand(Protocol):
         ...
 
 
+_TCommandDefFunc = Callable[[str], Optional[Type[SupportsCliCommand]]]
+
+
+def only_host(hosts: Union[str, Iterable[str]]) -> Callable[[_TCommandDefFunc], _TCommandDefFunc]:
+    """Emits cli command only if one if `hosts` was requested via plugin hook."""
+    allowed = frozenset({hosts} if isinstance(hosts, str) else hosts)
+
+    def decorator(fn: _TCommandDefFunc) -> _TCommandDefFunc:
+        @functools.wraps(fn)
+        def wrapper(host: str) -> Optional[Type[SupportsCliCommand]]:
+            if host not in allowed:
+                return None
+            return fn(host)
+
+        return wrapper
+
+    return decorator
+
+
 @hookspec()
-def plug_cli() -> SupportsCliCommand:
-    """Spec for plugin hook that returns current run context."""
+def plug_cli(host: str) -> Optional[Type[SupportsCliCommand]]:
+    """Spec for plugin hook that returns a CLI command class for a given CLI host.
+
+    Args:
+        host: Name of the CLI host requesting commands (e.g. `"dlt"`, `"dlthub"`).
+            Plugins return their command class only if they contribute to this host;
+
+    Returns:
+        Optional[Type[SupportsCliCommand]]: Command class to register, or `None` when
+        the plugin does not contribute to the requested host.
+    """
 
 
 class SupportsMcpFeatures(Protocol):
@@ -146,4 +203,49 @@ def plug_mcp(features: Set[str]) -> Optional[SupportsMcpFeatures]:
 
     Args:
         features: set of feature keywords the server requests
+    """
+
+
+class SupportsAgentLoop(Protocol):
+    """Protocol for an agent loop implementation returned by the plug_agent_loop hook"""
+
+    LOOP_TYPE: ClassVar[str]
+    """loop type string this class answers to"""
+
+    def init(self, agent_spec: Any) -> None:
+        """Prepares the loop from the agent declaration"""
+        ...
+
+    async def run(
+        self,
+        instructions: Optional[str] = None,
+        inputs: Optional[Dict[str, Any]] = None,
+        model: Optional[str] = None,
+        limits: Optional[Any] = None,
+        run_args: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Builds the native agent from the runtime arguments and runs it to completion"""
+        ...
+
+    @property
+    def native(self) -> Any:
+        """The underlying framework object, e.g. a Pydantic AI Agent"""
+        ...
+
+    @property
+    def trace(self) -> Any:
+        """Trace of the completed run"""
+        ...
+
+
+@hookspec()
+def plug_agent_loop(loop_type: str) -> Optional[Type[SupportsAgentLoop]]:
+    """Spec for plugin hook that returns an agent loop class for a given loop type.
+
+    Args:
+        loop_type: Loop type requested by the launcher, e.g. `"pydantic-ai"`.
+
+    Returns:
+        Optional[Type[SupportsAgentLoop]]: Loop class to instantiate, or `None` when the
+        plugin does not implement the requested loop.
     """

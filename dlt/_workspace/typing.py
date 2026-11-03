@@ -1,31 +1,29 @@
-from typing import Any, Dict, List, Literal, NamedTuple, Optional
-from dlt.common.typing import NotRequired
+import datetime  # noqa: I251
+from typing import List, Literal, NamedTuple, Optional
 
 from dlt.common.configuration.providers.provider import ConfigProvider
 from dlt.common.storages.configuration import TSchemaFileFormat
-from dlt.common.typing import TypedDict
+from dlt.common.typing import DictStrAny, NotRequired, TypedDict
+from dlt.pipeline.typing import TPipelineStep
+
+
+TWorkspaceLocalVerb = Literal["read", "write", "execute", "network", "all"]
+TWorkspaceDataVerb = Literal["read", "write", "all"]
+TWorkspaceContextVerb = Literal["read", "write", "execute", "deploy", "all"]
+
+
+class TWorkspaceAccess(TypedDict, total=False):
+    """What may be touched in a workspace. Declared by an agent, required by a tool."""
+
+    local: List[TWorkspaceLocalVerb]
+    """What may be done on the machine the workspace lives on."""
+    data: List[TWorkspaceDataVerb]
+    """Access to workspace data, governed by the dlt profile in use."""
+    context: List[TWorkspaceContextVerb]
+    """Access to the context graph: telemetry, runs and job definitions. Read-only."""
 
 
 TLocationScope = Literal["project", "global"]
-
-TAiStatusWarning = Literal[
-    "not_initialized",
-    "no_init_toolkit",
-    "no_toolkits",
-    "mcp_unavailable",
-]
-
-
-class TAiStatusInfo(TypedDict):
-    """AI setup status: version, agent, toolkits, and readiness warnings."""
-
-    dlt_version: str
-    agent_name: Optional[str]
-    initialized: bool
-    has_init_toolkit: bool
-    toolkits: Dict[str, "TToolkitIndexEntry"]
-    warnings: List[TAiStatusWarning]
-    mcp_error: NotRequired[str]
 
 
 class TLocationInfo(TypedDict):
@@ -45,121 +43,6 @@ class TProviderInfo(TypedDict):
     locations: List[TLocationInfo]
 
 
-class TProfileInfo(TypedDict):
-    """A single profile with its status flags."""
-
-    name: str
-    description: str
-    is_current: bool
-    is_pinned: bool
-    is_configured: bool
-
-
-class TCurrentProfileInfo(TProfileInfo):
-    """The active profile, extending base with session directories."""
-
-    data_dir: str
-    local_dir: str
-
-
-class TWorkbenchComponentInfo(TypedDict):
-    """A skill, command, or rule inside a workbench toolkit."""
-
-    name: str
-    description: str
-
-
-class TWorkbenchMcpServerInfo(TypedDict):
-    """MCP server definition inside a workbench toolkit."""
-
-    command: str
-    args: List[str]
-
-
-class TToolkitInfo(TypedDict):
-    """Core toolkit info from plugin.json + toolkit.json."""
-
-    name: str
-    version: str
-    description: str
-    tags: List[str]
-    dependencies: NotRequired[List[str]]
-    workflow_entry_skill: NotRequired[str]
-
-
-class TWorkbenchToolkitInfo(TToolkitInfo):
-    """Extends meta with structural data from directory scan."""
-
-    skills: List[TWorkbenchComponentInfo]
-    commands: List[TWorkbenchComponentInfo]
-    rules: List[TWorkbenchComponentInfo]
-    mcp_servers: NotRequired[Dict[str, TWorkbenchMcpServerInfo]]
-    has_ignore: bool
-
-
-class TToolkitIndexEntry(TToolkitInfo, total=False):
-    """Installed toolkit record. Inherits required meta fields, adds optional tracking."""
-
-    installed_at: str
-    agent: str
-    files: Dict[str, Any]
-    mcp_servers: List[str]
-
-
-class TWorkspaceInfo(TypedDict):
-    """Full workspace state returned by `fetch_workspace_info`."""
-
-    name: Optional[str]
-    run_dir: str
-    settings_dir: str
-    global_dir: str
-    profile: Optional[TCurrentProfileInfo]
-    configured_profiles: List[str]
-    providers: List[TProviderInfo]
-    dlt_version: str
-    dlthub_version: Optional[str]
-    initialized: bool
-    installed_toolkits: Dict[str, TToolkitIndexEntry]
-
-
-TDeploymentManifestStatus = Literal["ok", "not_found", "generation_failed"]
-
-
-class TDeploymentJobInfo(TypedDict):
-    """A single job entry in the deployment manifest summary."""
-
-    job_ref: str
-    display_label: str
-    category: str
-    default_trigger: NotRequired[str]
-    triggers: List[str]
-
-
-class TDeploymentManifestInfo(TypedDict):
-    """Summary of the workspace deployment manifest."""
-
-    status: TDeploymentManifestStatus
-    error: NotRequired[str]
-    total_jobs: NotRequired[int]
-    counts_by_category: NotRequired[Dict[str, int]]
-    jobs: NotRequired[List[TDeploymentJobInfo]]
-
-
-class TRunJobInfo(TypedDict):
-    """Resolved `workspace run` request — all data needed to launch the job."""
-
-    job_ref: str
-    display_label: str
-    trigger: str
-    trigger_humanized: str
-    launcher: str
-    run_id: str
-    entry_point: Dict[str, Any]
-    manifest_warnings: List[str]
-    refresh_warning: NotRequired[str]
-    profile_warning: NotRequired[str]
-
-
 class TSourceItem(TypedDict):
     """A source returned by the AI context search API."""
 
@@ -175,6 +58,25 @@ class TSchemaExport(TypedDict):
     schema_name: str
     format_: TSchemaFileFormat
     content: str
+
+
+class TTraceStepMetrics(TypedDict):
+    """Files, rows and sizes of a step in a pipeline trace."""
+
+    step: TPipelineStep
+    started_at: datetime.datetime
+    finished_at: NotRequired[datetime.datetime]
+    load_ids: List[str]
+    tables: NotRequired[List[DictStrAny]]
+    """`DataWriterMetrics` of each table with `table_name`. Extract and normalize only."""
+    resources: NotRequired[List[DictStrAny]]
+    """`DataWriterMetrics` of each resource with `resource_name`. Extract only."""
+    files: NotRequired[List[DictStrAny]]
+    """`DataWriterMetrics` of each file with `job_id` and `table_name`. Extract and normalize
+    only."""
+    jobs: NotRequired[List[DictStrAny]]
+    """`LoadJobMetrics` of each job. Load only."""
+    step_exception: NotRequired[str]
 
 
 class ProviderLocationInfo(NamedTuple):

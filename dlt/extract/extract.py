@@ -1,15 +1,21 @@
 import contextlib
 from collections.abc import Sequence as C_Sequence
 from copy import copy
-import itertools
-from typing import Iterator, List, Dict, Any, Optional
+from typing import Iterator, List, Dict, Any, Mapping, Optional, Tuple, cast
 import yaml
 
 from dlt.common import logger
 from dlt.common.configuration.container import Container
-from dlt.common.configuration.resolve import inject_section
+from dlt.common.configuration.exceptions import ConfigurationException
+from dlt.common.configuration.resolve import inject_section, resolve_configuration
 from dlt.common.configuration.specs import ConfigSectionContext, known_sections
-from dlt.common.data_writers.writers import EMPTY_DATA_WRITER_METRICS, TDataItemFormat
+from dlt.common.data_writers.writers import TDataItemFormat
+from dlt.common.metrics import (
+    EMPTY_DATA_WRITER_METRICS,
+    DataWriterAndCustomMetrics,
+    TDataLocation,
+    aggregate_job_metrics,
+)
 from dlt.common.pipeline import (
     ExtractDataInfo,
     ExtractInfo,
@@ -17,19 +23,23 @@ from dlt.common.pipeline import (
     SupportsPipeline,
     WithStepInfo,
 )
-from dlt.common.typing import TColumnNames, TLoaderFileFormat
+from dlt.common.normalizers.json import helpers as normalize_helpers
+from dlt.common.typing import TColumnNames, TLoaderFileFormat, TTableHintTemplate
+from dlt.common.runners.configuration import PoolRunnerConfiguration
 from dlt.common.runtime import signals
 from dlt.common.runtime.collector import Collector, NULL_COLLECTOR
 from dlt.common.schema import Schema, utils
 from dlt.common.schema.typing import (
     TAnySchemaColumns,
+    TPartialTableSchema,
     TSchemaContract,
     TTableFormat,
+    TTableSchema,
     TWriteDispositionConfig,
 )
 from dlt.common.storages import NormalizeStorageConfiguration, LoadPackageInfo, SchemaStorage
+from dlt.common.storages.job_metrics import merge_metrics, metrics_by_job, metrics_by_table
 from dlt.common.storages.load_package import (
-    ParsedLoadJobFileName,
     LoadPackageStateInjectableContext,
     TLoadPackageState,
     commit_load_package_state,
@@ -38,6 +48,7 @@ from dlt.common.utils import (
     get_callable_name,
     get_full_obj_class_name,
     group_dict_of_lists,
+    is_interactive,
     update_dict_nested,
 )
 
@@ -46,10 +57,14 @@ from dlt.extract.decorators import (
     SourceInjectableContext,
     SourceSchemaInjectableContext,
 )
-from dlt.extract.exceptions import UnknownSourceReference
+from dlt.extract.exceptions import (
+    DataItemRequiredForDynamicTableHints,
+    ExtraPlaceholderError,
+    UnknownSourceReference,
+)
 from dlt.extract.incremental import IncrementalResourceWrapper
+from dlt.extract.items import TableNameMeta
 from dlt.extract.items_transform import ItemTransform
-from dlt.common.metrics import DataWriterAndCustomMetrics
 from dlt.extract.pipe_iterator import PipeIterator
 from dlt.extract.source import DltSource
 from dlt.extract.reference import SourceReference, SourceFactory
@@ -57,7 +72,11 @@ from dlt.extract.resource import DltResource
 from dlt.extract.storage import ExtractStorage
 from dlt.extract.extractors import ObjectExtractor, ArrowExtractor, Extractor, ModelExtractor
 from dlt.extract.state import reset_resource_state
-from dlt.extract.utils import get_data_item_format, make_schema_with_default_name
+from dlt.extract.utils import (
+    get_data_item_format,
+    get_unbalanced_files_warning,
+    make_schema_with_default_name,
+)
 
 
 def select_schema(pipeline: SupportsPipeline) -> Schema:
@@ -232,9 +251,131 @@ def describe_extract_data(data: Any) -> List[ExtractDataInfo]:
     return data_info
 
 
+def get_variant_name(schema: Schema, resource: DltResource, table_name: str) -> Optional[str]:
+    """Returns the raw name of a variant declared on `resource` that generates `table_name`,
+    matched by normalized name."""
+    for variant_name in resource._hints_variants:
+        if (
+            normalize_helpers.normalize_table_identifier(schema, schema.naming, variant_name)
+            == table_name
+        ):
+            return variant_name
+    return None
+
+
+def get_fresh_write_disposition(
+    schema: Schema, resource: DltResource, table: TTableSchema
+) -> Optional[TWriteDispositionConfig]:
+    """Computes updated write disposition based on write disposition hint in resource and actual table definition."""
+
+    # NOTE: this could be converted into a full schema update for tables that didn't receive data but several
+    # improvements should be made. ie. all variant tables must be defined upfront and not come with the data
+    # this is not checked by compute_tables and not checked when schema is merged
+
+    wd_config: TTableHintTemplate[TWriteDispositionConfig] = None
+    table_path = schema.naming.break_path(table["name"])
+    # recognize variants by the `variant_name` hint or by normalized name lookup (schemas
+    # created before the hint was introduced)
+    if variant_name := (
+        table.get("variant_name") or get_variant_name(schema, resource, table["name"])
+    ):
+        # variant table: take the write disposition declared on the variant hints. a variant
+        # that is not re-declared keeps the stored disposition
+        wd_config = (resource._hints_variants.get(variant_name) or {}).get("write_disposition")
+    elif len(table_path) > 1:
+        # pseudo-root (nested table broken out by a primary key): recompute the schema
+        root_table_name = table_path[0]
+        if root_table_schema := schema.tables.get(root_table_name):
+            variant_name = root_table_schema.get("variant_name") or get_variant_name(
+                schema, resource, root_table_name
+            )
+            # if root table is a variant it must be re-declared
+            if variant_name and variant_name not in resource._hints_variants:
+                # correct computation won't be possible
+                return None
+            with contextlib.suppress(DataItemRequiredForDynamicTableHints):
+                for table_name, _, hints in resource.get_nested_hints(
+                    root_table_name,
+                    schema.naming,
+                    item=None,
+                    meta=TableNameMeta(variant_name) if variant_name else None,
+                ):
+                    if table_name == table["name"]:
+                        wd_config = hints.get("write_disposition")
+                        break
+    else:
+        # static table definition
+        wd_config = resource.write_disposition
+
+    if wd_config is not None:
+        if callable(wd_config):
+            wd_config = None
+        elif isinstance(wd_config, str):
+            wd_config = {"disposition": wd_config}
+    return wd_config
+
+
+def _replace_callables_with_names(value: Any) -> Any:
+    """Returns a copy of nested dicts and lists of `value` with callables replaced by their
+    names."""
+    if callable(value):
+        return get_callable_name(value)
+    if isinstance(value, dict):
+        return {k: _replace_callables_with_names(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_replace_callables_with_names(v) for v in value]
+    return value
+
+
+def _hints_for_trace(hints: Mapping[str, Any]) -> Dict[str, Any]:
+    """Returns `hints` of a resource or a nested table in a form that the trace can pickle and
+    dump to JSON."""
+    trace_hints: Dict[str, Any] = {}
+    for name, hint in hints.items():
+        if hint is None or name == "validator":
+            continue
+        if name == "incremental":
+            # represent incremental as dictionary (it derives from BaseConfiguration)
+            if isinstance(hint, IncrementalResourceWrapper):
+                hint = hint.incremental
+            # sometimes internal incremental is not bound
+            if hint:
+                trace_hints[name] = dict(hint)
+        elif name == "original_columns":
+            # this is original type of the columns ie. Pydantic model
+            trace_hints[name] = get_full_obj_class_name(hint)
+        elif callable(hint):
+            trace_hints[name] = get_callable_name(hint)
+        elif name == "columns":
+            if hint:
+                trace_hints[name] = yaml.dump(
+                    hint, allow_unicode=True, default_flow_style=False, sort_keys=False
+                )
+        elif name == "write_disposition" and isinstance(hint, dict):
+            trace_hints[name] = _replace_callables_with_names(hint)
+            # a user named placeholder would add a trace column, an entry adds a row
+            if placeholders := trace_hints[name].get("extra_placeholders"):
+                trace_hints[name]["extra_placeholders"] = [
+                    {"name": k, "value": v} for k, v in placeholders.items()
+                ]
+        elif name == "nested_hints":
+            # a path is a tuple of identifiers and JSON keys are strings, so the trace lists them
+            trace_hints[name] = [
+                {"path": [path] if isinstance(path, str) else list(path), **_hints_for_trace(h)}
+                for path, h in hint.items()
+            ]
+        else:
+            # ie. `extra_placeholders` in write dispositions
+            trace_hints[name] = _replace_callables_with_names(hint)
+    return trace_hints
+
+
 class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
     original_data: Any
     """Original data from which the extracted DltSource was created. Will be used to describe in extract info"""
+
+    _last_extractors: Dict[TDataItemFormat, Extractor] = None
+    """Most recently used extractors"""
 
     def __init__(
         self,
@@ -252,18 +393,8 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
         super().__init__()
 
     def _compute_metrics(self, load_id: str, source: DltSource) -> ExtractMetrics:
-        # map by job id
-        job_metrics = {
-            ParsedLoadJobFileName.parse(m.file_path): m
-            for m in self.extract_storage.closed_files(load_id)
-        }
-        # aggregate by table name
-        table_metrics = {
-            table_name: sum(map(lambda pair: pair[1], metrics), EMPTY_DATA_WRITER_METRICS)
-            for table_name, metrics in itertools.groupby(
-                job_metrics.items(), lambda pair: pair[0].table_name
-            )
-        }
+        job_metrics = metrics_by_job(self.extract_storage.closed_files(load_id))
+        table_metrics = metrics_by_table(job_metrics)
 
         # aggregate by resource name
         def _get_all_resource_custom_metrics(resource_name: str) -> Dict[str, Any]:
@@ -273,14 +404,16 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
                     all_custom_metrics = update_dict_nested(all_custom_metrics, step.custom_metrics)
             return all_custom_metrics
 
+        resource_agg = aggregate_job_metrics(
+            table_metrics,
+            lambda table_name: source.schema.get_table(table_name)["resource"],
+        )
         resource_metrics = {
             resource_name: DataWriterAndCustomMetrics(
-                *sum(map(lambda pair: pair[1], metrics), EMPTY_DATA_WRITER_METRICS),
+                *metrics,
                 custom_metrics=_get_all_resource_custom_metrics(resource_name),
             )
-            for resource_name, metrics in itertools.groupby(
-                table_metrics.items(), lambda pair: source.schema.get_table(pair[0])["resource"]
-            )
+            for resource_name, metrics in resource_agg.items()
         }
         # backfill resources that produced no writer output but carry custom metrics
         # (e.g. every item was filtered out) so `add_metrics` /
@@ -297,37 +430,23 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
         # collect resource hints
         clean_hints: Dict[str, Dict[str, Any]] = {}
         for resource in source.selected_resources.values():
-            # cleanup the hints
-            hints = clean_hints[resource.name] = {}
             resource_hints = copy(resource._hints) or resource.compute_table_schema()
             if resource.incremental and "incremental" not in resource_hints:
                 resource_hints["incremental"] = resource.incremental  # type: ignore
+            clean_hints[resource.name] = _hints_for_trace(resource_hints)
 
-            for name, hint in resource_hints.items():
-                if hint is None or name in ["validator"]:
-                    continue
-                if name == "incremental":
-                    # represent incremental as dictionary (it derives from BaseConfiguration)
-                    if isinstance(hint, IncrementalResourceWrapper):
-                        hint = hint.incremental
-                    # sometimes internal incremental is not bound
-                    if hint:
-                        hints[name] = dict(hint)  # type: ignore[call-overload]
-                    continue
-                if name == "original_columns":
-                    # this is original type of the columns ie. Pydantic model
-                    hints[name] = get_full_obj_class_name(hint)
-                    continue
-                if callable(hint):
-                    hints[name] = get_callable_name(hint)
-                    continue
-                if name == "columns":
-                    if hint:
-                        hints[name] = yaml.dump(
-                            hint, allow_unicode=True, default_flow_style=False, sort_keys=False
-                        )
-                    continue
-                hints[name] = hint
+        inputs: List[TDataLocation] = []
+        source_ref = source._factory.ref.ref if source._factory and source._factory.ref else None
+        for resource in {r._pipe.instance_id: r for r in source.resources.extracted}.values():
+            if resource.inputs:
+                inputs.extend(
+                    {**location, "resource_name": resource.name} for location in resource.inputs
+                )
+            # a transformer reads from its parent, which is an edge in the dag, not a location
+            elif not resource.is_transformer and (code_ref := source_ref or resource._code_ref):
+                inputs.append(
+                    {"kind": "code", "location": code_ref, "resource_name": resource.name}
+                )
 
         return {
             "started_at": None,
@@ -338,28 +457,63 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
             "resource_metrics": resource_metrics,
             "dag": source.resources.selected_dag,
             "hints": clean_hints,
+            "inputs": inputs,
         }
 
-    def _write_empty_files(
+    def _handle_empty_tables(
         self, source: DltSource, extractors: Dict[TDataItemFormat, Extractor]
     ) -> None:
+        """Tables that are present in schema and in extracted resources but without data items require special handling"""
         schema = source.schema
         json_extractor = extractors["object"]
         tables_with_items = set().union(*[e.tables_with_items for e in extractors.values()])
-        # find REPLACE resources that did not yield any pipe items and create empty jobs for them
-        # NOTE: do not include tables that have never seen data
+        computed_tables = set().union(*[e.computed_tables for e in extractors.values()])
+        # find REPLACE resources that yielded no data and register their tables for truncation;
+        # tables that never saw data are excluded (nothing to truncate)
         data_tables = {t["name"]: t for t in schema.data_tables(seen_data_only=True)}
         tables_by_resources = utils.group_tables_by_resource(data_tables)
         for resource in source.resources.selected.values():
             if resource.name not in tables_by_resources:
                 continue
+            # dynamic write dispositions can't be handled here
+            resource_write_disposition = resource.write_disposition_shorthand
+            if resource_write_disposition is None:
+                continue
             for table in tables_by_resources[resource.name]:
-                write_disposition = table.get("write_disposition") or resource.write_disposition
-                if write_disposition != "replace" or table["name"] in tables_with_items:
+                table_name = table["name"]
+                # we only need to handle root tables
+                if utils.is_nested_table(table) or table_name in tables_with_items:
                     continue
-                # we only need to write empty files for the root tables
-                if not utils.is_nested_table(table):
-                    json_extractor.write_empty_items_file(table["name"])
+
+                # truncate tables only for resources marked as "replace"
+                if resource_write_disposition != "replace":
+                    continue
+
+                # compute the current write disposition in memory
+                if table_name not in computed_tables:
+                    wd_config = get_fresh_write_disposition(schema, resource, table)
+                    disposition = (
+                        wd_config["disposition"]
+                        if isinstance(wd_config, dict)
+                        # fall back to the stored disposition when it can't be re-derived
+                        else (wd_config or table.get("write_disposition"))
+                    )
+                    # apply the fresh disposition so the load package schema replaces the table
+                    if disposition == "replace" and table.get("write_disposition") != "replace":
+                        partial_table: Dict[str, Any] = {
+                            "name": table_name,
+                            "columns": {},
+                            "write_disposition": wd_config,
+                        }
+                        resource._merge_write_disposition_dict(partial_table)
+                        schema.update_table(cast(TPartialTableSchema, partial_table))
+                else:
+                    disposition = table.get("write_disposition")
+
+                # table itself must accept replace
+                if disposition == "replace":
+                    # write empty file so a replace root is truncated even though it received no data
+                    json_extractor.write_empty_items_file(table_name)
 
         # collect tables that received empty materialized lists and had no items
         tables_with_empty = (
@@ -370,6 +524,50 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
         for table_name in tables_with_empty:
             json_extractor.write_empty_items_file(table_name)
 
+    def _resolve_extra_placeholders(
+        self,
+        source: DltSource,
+        extractors: Dict[TDataItemFormat, Extractor],
+        state: TLoadPackageState,
+    ) -> None:
+        """Stores the values of `extra_placeholders` and the `scd2` boundary of the merge write
+        dispositions in the load package, by root table and pseudo-root. Callable values receive
+        the resource and the table name.
+        """
+        schema = source.schema
+        # an empty materialized table also gets a job, so its merge needs the values too
+        tables_with_jobs = set().union(
+            *[e.tables_with_items | e.tables_with_empty for e in extractors.values()]
+        )
+        for root_table_name in tables_with_jobs:
+            root_table = schema.tables.get(root_table_name)
+            if root_table is None or utils.is_nested_table(root_table):
+                continue
+            resource = source.resources.get(root_table.get("resource"))
+            if resource is None:
+                continue
+            # a variant that is not declared anymore falls back to the resource hints
+            variant_name = root_table.get("variant_name")
+            placeholders = resource.get_extra_placeholders(
+                root_table_name,
+                schema.naming,
+                TableNameMeta(variant_name) if variant_name else None,
+            )
+            for table_name, extra_placeholders in placeholders.items():
+                table = schema.tables.get(table_name)
+                # a pseudo-root (nested table broken out by a key) merges on its own
+                if table is None or utils.is_nested_table(table):
+                    continue
+                values: Dict[str, Any] = {}
+                for name, value in extra_placeholders.items():
+                    if callable(value):
+                        try:
+                            value = value(resource, table_name)
+                        except Exception as ex:
+                            raise ExtraPlaceholderError(resource.name, table_name, name, ex) from ex
+                    values[name] = value
+                state.setdefault("placeholders", {})[table_name] = values
+
     def _extract_single_source(
         self,
         load_id: str,
@@ -377,6 +575,7 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
         *,
         max_parallel_items: int,
         workers: int,
+        package_state: TLoadPackageState,
     ) -> None:
         schema = source.schema
         collector = self.collector
@@ -418,7 +617,9 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
                             resource, pipe_item.item, pipe_item.meta
                         )
 
-                    self._write_empty_files(source, extractors)
+                    self._handle_empty_tables(source, extractors)
+                    self._resolve_extra_placeholders(source, extractors, package_state)
+                    self._last_extractors = extractors
                     if left_gens > 0:
                         # go to 100%
                         collector.update("Resources", left_gens)
@@ -481,14 +682,22 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
 
                 # reset resource states, the `extracted` list contains all the explicit resources and all their parents
                 for resource in source.resources.extracted:
-                    if resource.write_disposition == "replace":
-                        reset_resource_state(resource.name)
+                    if resource.write_disposition_shorthand != "replace":
+                        continue
+                    write_disposition = resource.write_disposition
+                    # the dict form keeps the state unless exclude_resource_state is False
+                    if isinstance(write_disposition, dict) and write_disposition.get(
+                        "exclude_resource_state", True
+                    ):
+                        continue
+                    reset_resource_state(resource.name)
 
                 self._extract_single_source(
                     load_id,
                     source,
                     max_parallel_items=max_parallel_items,
                     workers=workers,
+                    package_state=load_package.state,
                 )
                 commit_load_package_state()
         return load_id
@@ -502,6 +711,49 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
             )
         # all load ids got processed, cleanup empty folder
         self.extract_storage.delete_empty_extract_folder()
+
+    def warn_on_unbalanced_files(self, pipeline_name: str) -> None:
+        """Warns for each extracted load package whose files leave normalize workers mostly idle"""
+        try:
+            self._warn_on_unbalanced_files(pipeline_name)
+        except Exception as ex:
+            # a diagnostic must not fail the extract step
+            logger.warning(f"Could not check the balance of extracted files: {ex}")
+
+    def _warn_on_unbalanced_files(self, pipeline_name: str) -> None:
+        # `Pipeline.normalize` runs a single worker in interactive sessions
+        if is_interactive():
+            return
+        try:
+            # resolve only the workers of the normalize pool, other fields belong to normalize
+            normalize_workers = resolve_configuration(
+                PoolRunnerConfiguration(workers=1),
+                sections=(known_sections.NORMALIZE,),
+                accept_partial=True,
+            ).workers
+        except ConfigurationException:
+            return
+        if not normalize_workers:
+            return
+        object_storage = self.extract_storage.item_storages["object"]
+        for load_id, metrics in self._load_id_metrics.items():
+            schema = self.schema_storage[metrics[0]["schema_name"]]
+            files = [m for step in metrics for m in step["job_metrics"].values()]
+            file_limits: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
+            for table_name in merge_metrics(step["table_metrics"] for step in metrics):
+                _, writer = object_storage.get_active_writer(load_id, schema.name, table_name)
+                if writer:
+                    file_limits[table_name] = (writer.file_max_items, writer.file_max_bytes)
+            message = get_unbalanced_files_warning(
+                pipeline_name,
+                load_id,
+                files,
+                file_limits,
+                schema.dlt_table_names(),
+                normalize_workers,
+            )
+            if message:
+                logger.warning(message)
 
     def get_step_info(self, pipeline: SupportsPipeline) -> ExtractInfo:
         load_ids = list(self._load_id_metrics.keys())

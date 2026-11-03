@@ -49,8 +49,12 @@ class DestinationClient(JobClientBase):
         self,
         only_tables: Iterable[str] = None,
         expected_update: TSchemaTables = None,
+        force: bool = False,
+        include_existing_tables: bool = False,
     ) -> Optional[TSchemaTables]:
-        return super().update_stored_schema(only_tables, expected_update)
+        return super().update_stored_schema(
+            only_tables, expected_update, force, include_existing_tables
+        )
 
     def create_load_job(
         self, table: PreparedTableSchema, file_path: str, load_id: str, restore: bool = False
@@ -59,12 +63,6 @@ class DestinationClient(JobClientBase):
         if self.config.skip_dlt_columns_and_tables:
             if is_dlt_table_or_column(table["name"], self.schema._dlt_tables_prefix):
                 return FinalizedLoadJob(file_path)
-
-        skipped_columns: List[str] = []
-        if self.config.skip_dlt_columns_and_tables:
-            for column in list(self.schema.get_table(table["name"])["columns"].keys()):
-                if is_dlt_table_or_column(column, self.schema._dlt_tables_prefix):
-                    skipped_columns.append(column)
 
         # save our state in destination name scope
         load_state = destination_state()
@@ -76,7 +74,6 @@ class DestinationClient(JobClientBase):
                 self.config,
                 load_state,
                 self.destination_callable,
-                skipped_columns,
             )
         if parsed_file.file_format in ["jsonl", "typed-jsonl"]:
             return DestinationJsonlLoadJob(
@@ -84,7 +81,6 @@ class DestinationClient(JobClientBase):
                 self.config,
                 load_state,
                 self.destination_callable,
-                skipped_columns,
             )
         return None
 
